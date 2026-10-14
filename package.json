@@ -11,6 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "seed": "tsx src/db/seed.ts",
+    "db:import-local-to-turso": "tsx src/db/import-local-to-turso.ts",
     "backfill:phash": "tsx src/db/backfill-phash.ts",
     "typecheck": "tsc --noEmit",
     "db:migrate": "tsx src/db/migrate.ts"
