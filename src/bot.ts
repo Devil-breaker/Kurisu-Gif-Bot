@@ -66,7 +66,6 @@ import {
   resolveChannelExpression,
   getChatSettings,
   upsertChatSettings,
-  isExpressionDisabledInChat,
   toggleExpressionLewd,
   findVisualDuplicate,
   mergeMedia,
@@ -1438,7 +1437,7 @@ export function createBot() {
     const chatSettings = await getChatSettings(chatId);
 
     // Lock check
-    if (await isExpressionDisabledInChat(chatId, expression.name)) {
+    if (chatSettings.disabled_commands.includes(expression.name.toLowerCase())) {
       await ctx.reply(`❌ Command /${expression.name} is currently disabled in this chat.`);
       return;
     }

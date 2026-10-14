@@ -1,7 +1,6 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { createBot } from '../src/bot.js';
 import { loadConfig } from '../src/config.js';
-import { getDb } from '../src/db/client.js';
 
 // grammY docs: a webhook function must return an explicit response and must
 // not let the bot process update processing errors uncaught — wrap in try/catch.
@@ -40,9 +39,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Webhook handling does not call bot.start(), so grammY needs an explicit
   // init() to load botInfo before handleUpdate() can process commands.
   await initializeBot();
-
-  // Ensure DB schema exists before handling (no-op after first request per instance)
-  await getDb().execute('SELECT 1');
 
   try {
     await bot.handleUpdate(req.body as never);
