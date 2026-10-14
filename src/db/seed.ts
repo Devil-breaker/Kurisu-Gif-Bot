@@ -49,7 +49,7 @@ const DEFAULT_EXPRESSIONS: Array<{
 async function main() {
   const url = process.env.TURSO_URL;
   const db = url
-    ? createClient({ url })
+    ? createClient({ url, authToken: process.env.TURSO_AUTH_TOKEN })
     : createClient({ url: pathToFileURL(join(process.cwd(), 'data', 'bot.db')).href });
 
   await runMigrations(db);
