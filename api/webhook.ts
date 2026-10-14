@@ -7,6 +7,19 @@ import { getDb } from '../src/db/client.js';
 // not let the bot process update processing errors uncaught — wrap in try/catch.
 const bot = createBot();
 const config = loadConfig();
+let botInitialization: Promise<void> | undefined;
+
+function initializeBot(): Promise<void> {
+  if (!botInitialization) {
+    botInitialization = bot.init().catch((err: unknown) => {
+      // Allow a later webhook invocation to retry if Telegram or the network
+      // is temporarily unavailable during initialization.
+      botInitialization = undefined;
+      throw err;
+    });
+  }
+  return botInitialization;
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
@@ -23,6 +36,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
   }
+
+  // Webhook handling does not call bot.start(), so grammY needs an explicit
+  // init() to load botInfo before handleUpdate() can process commands.
+  await initializeBot();
 
   // Ensure DB schema exists before handling (no-op after first request per instance)
   await getDb().execute('SELECT 1');
