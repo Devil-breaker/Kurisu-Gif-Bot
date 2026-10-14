@@ -1,0 +1,52 @@
+{
+  "name": "kurisu-gif-bot",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Kurisu Gif Bot - Anime themed bot for sending GIFs in chat with reverse search",
+  "main": "dist/bot.js",
+  "scripts": {
+    "dev": "tsx watch src/dev.ts",
+    "build": "tsc --build",
+    "start": "node dist/dev.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "seed": "tsx src/db/seed.ts",
+    "backfill:phash": "tsx src/db/backfill-phash.ts",
+    "typecheck": "tsc --noEmit",
+    "db:migrate": "tsx src/db/migrate.ts"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "gif",
+    "anime",
+    "saucenao"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@grammyjs/auto-retry": "^1.1.0",
+    "@grammyjs/ratelimiter": "^1.1.0",
+    "@grammyjs/transformer-throttler": "^1.2.1",
+    "@libsql/client": "^0.14.0",
+    "dotenv": "^16.4.5",
+    "ffmpeg-static": "^5.2.0",
+    "grammy": "^1.26.0",
+    "iqdb-client": "^3.0.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@vercel/node": "^23.0.0"
+  },
+  "allowScripts": {
+    "ffmpeg-static@5.3.0": true,
+    "esbuild@0.28.2": true,
+    "esbuild@0.21.5": true
+  }
+}

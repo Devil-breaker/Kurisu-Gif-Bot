@@ -1,0 +1,1925 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import type { Context } from 'grammy';
+import { Bot, GrammyError, HttpError, InputFile, session } from 'grammy';
+
+
+/** Sessions live in the configured database so polling and webhook instances share state. */
+async function flushSession(key: string, sess: BotContext['session']): Promise<void> {
+  if (sess === undefined) {
+    await getDb().execute({ sql: 'DELETE FROM bot_sessions WHERE session_key = ?', args: [key] });
+  } else {
+    await getDb().execute({
+      sql: `INSERT INTO bot_sessions (session_key, session_json) VALUES (?, ?)
+            ON CONFLICT(session_key) DO UPDATE SET session_json = excluded.session_json,
+              updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+      args: [key, JSON.stringify(sess)],
+    });
+  }
+}
+
+async function loadSession(key: string): Promise<BotContext['session'] | undefined> {
+  const result = await getDb().execute({
+    sql: 'SELECT session_json FROM bot_sessions WHERE session_key = ?',
+    args: [key],
+  });
+  const raw = result.rows[0]?.session_json;
+  if (typeof raw !== 'string') return undefined;
+  try {
+    return JSON.parse(raw) as BotContext['session'];
+  } catch {
+    await flushSession(key, undefined);
+    return undefined;
+  }
+}
+
+async function deleteSession(key: string): Promise<void> {
+  await flushSession(key, undefined);
+}
+
+/** Simple async sleep for rate-limiting delays */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+import {
+  getExpressionByAlias,
+  getExpressionByName,
+  listExpressions,
+  createExpression,
+  deleteExpression,
+  updateCaptionTemplate,
+  getMediaByFileUniqueId,
+  insertMedia,
+  setMediaChannelMsgId,
+  setMediaChannelMsgIdIfMissing,
+  linkMediaToExpression,
+  getRandomMediaForExpression,
+  incrementUsage,
+  getMediaStats,
+  deleteMediaById,
+  unlinkMediaFromExpression,
+  isAdmin,
+  addAdmin,
+  removeAdmin,
+  listAdmins,
+  resolveChannelExpression,
+  getChatSettings,
+  upsertChatSettings,
+  isExpressionDisabledInChat,
+  toggleExpressionLewd,
+  findVisualDuplicate,
+  mergeMedia,
+  setMediaPhash,
+  setMediaLewd,
+} from './db/queries.js';
+import { getDb } from './db/client.js';
+import { loadConfig } from './config.js';
+import { reverseSearch } from './services/sauce.js';
+import { downloadLinePackZip, parseLinePackUrl } from './services/line-stickers.js';
+import { createLineTelegramPack } from './services/line-sticker-create.js';
+import { computePhash, hammingDistance } from './services/phash.js';
+import { TELEGRAM_CAPTION_LIMIT, clampVisible, formatCaption } from './services/caption.js';
+import {
+  buildAdminsMessage,
+  buildBotAdminPanel,
+  buildExpressionListMessage,
+  buildGroupAdminPanel,
+  buildLewdCommandsPanel,
+  buildLocksMessage,
+  buildMainMenuMessage,
+  buildSauceCaption,
+  buildSauceKeyboard,
+  buildStartMessage,
+  buildStatsMessage,
+  buildStatsMessageText,
+  buildUserCommandsPanel,
+  quoteMenuText,
+  CALLBACK_DATA,
+  type BuiltMessage,
+} from './services/messages.js';
+import type { Expression } from './types/index.js';
+
+interface UploadSessionItem {
+  channelMsgId: number;
+  mediaId: number | null;
+  deleteMediaOnRemove: boolean;
+  duplicateOfChannelMsgId?: number;
+  expressionIds?: number[];
+  expressionIdsAdded?: number[];
+}
+
+interface BotContext extends Context {
+  session?: {
+    activeExpression?: string;
+    activeExpressions?: string[];
+    rescanActive?: boolean;
+    rescanMode?: 'index' | 'relink';
+    rescannedCount?: number;
+    uploadedCount?: number;
+    uploadedItems?: UploadSessionItem[];
+  };
+}
+
+/** Undo only library records and expression links introduced by removed uploads. */
+async function cleanupRemovedUploadItems(
+  removedItems: UploadSessionItem[],
+  remainingItems: UploadSessionItem[],
+): Promise<void> {
+  const mediaIds = new Set(removedItems.map((item) => item.mediaId).filter((id): id is number => id !== null));
+  for (const mediaId of mediaIds) {
+    const removed = removedItems.filter((item) => item.mediaId === mediaId);
+    const remaining = remainingItems.filter((item) => item.mediaId === mediaId);
+    if (remaining.length === 0 && removed.some((item) => item.deleteMediaOnRemove)) {
+      await deleteMediaById(mediaId).catch((err) => {
+        console.error('[remove] channel post deleted but database cleanup failed:', err);
+      });
+      continue;
+    }
+
+    // If the original post that created this media row was removed, point the
+    // row at another surviving copy from this upload session.
+    if (remaining.length > 0 && removed.some((item) => item.deleteMediaOnRemove)) {
+      await setMediaChannelMsgId(mediaId, remaining[0].channelMsgId).catch((err) => {
+        console.error('[remove] could not relink surviving channel copy:', err);
+      });
+    }
+
+    const addedExpressionIds = new Set(removed.flatMap((item) => item.expressionIdsAdded ?? []));
+    for (const expressionId of addedExpressionIds) {
+      const stillUsed = remaining.some((item) => item.expressionIds?.includes(expressionId));
+      if (!stillUsed) {
+        await unlinkMediaFromExpression(mediaId, expressionId).catch((err) => {
+          console.error('[remove] could not undo expression tag:', err);
+        });
+      }
+    }
+  }
+}
+
+/** Bot process start time for uptime calculation */
+const PROCESS_START_TIME = Date.now();
+
+/** Format milliseconds to human-readable uptime string */
+function formatUptime(ms: number): string {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+
+  if (days > 0) {
+    return `${days}d ${hours % 24}h ${minutes % 60}m`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${seconds % 60}s`;
+  }
+  return `${seconds}s`;
+}
+
+/**
+ * Report a failed Bot API call with the detail needed to fix it.
+ *
+ * A bare `console.error(err)` on a GrammyError prints the message but not the
+ * payload, which is where the cause always is: the parse_mode in force and the
+ * text that failed to parse. Length is logged because Telegram measures it
+ * after entity parsing, so the number that matters is not the one in the
+ * source. The snippet is capped — captions can be 1024 characters.
+ */
+function logApiError(label: string, err: unknown, extra: Record<string, unknown> = {}): void {
+  if (err instanceof GrammyError) {
+    const payload = err.payload as Record<string, unknown>;
+    const body = (payload?.text ?? payload?.caption) as string | undefined;
+    console.error(`[${label}] Telegram rejected ${err.method}:`, {
+      error_code: err.error_code,
+      description: err.description,
+      parse_mode: payload?.parse_mode ?? '(none)',
+      chat_id: payload?.chat_id,
+      body_length: body?.length,
+      body_snippet: body?.slice(0, 300),
+      ...extra,
+    });
+    return;
+  }
+  if (err instanceof HttpError) {
+    console.error(`[${label}] Could not reach Telegram:`, err.error, extra);
+    return;
+  }
+  console.error(`[${label}]`, err, extra);
+}
+
+/** Download a file from Telegram servers to a Buffer. */
+async function downloadTelegramFile(ctx: Context, fileId: string): Promise<Buffer> {
+  const config = loadConfig();
+  const fileInfo = await ctx.api.getFile(fileId);
+  if (!fileInfo.file_path) {
+    throw new Error('Could not retrieve file path from Telegram');
+  }
+
+  // Contains the bot token: never log it and never put it in a message.
+  const downloadUrl = `https://api.telegram.org/file/bot${config.BOT_TOKEN}/${fileInfo.file_path}`;
+  const fileRes = await fetch(downloadUrl, { signal: AbortSignal.timeout(20_000) });
+  if (!fileRes.ok) {
+    throw new Error(`Failed to download file from Telegram: ${fileRes.status} ${fileRes.statusText}`);
+  }
+
+  return Buffer.from(await fileRes.arrayBuffer());
+}
+
+async function computeTelegramFilePhash(ctx: Context, fileId: string): Promise<string | null> {
+  const tmpDir = await mkdtemp(join(tmpdir(), 'phash-'));
+  try {
+    const tmpPath = join(tmpDir, 'file.bin');
+    await writeFile(tmpPath, await downloadTelegramFile(ctx, fileId));
+    return await computePhash(tmpPath);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Telegram's own rule for a command in the /commands menu: 1-32 characters,
+ * lowercase letters, digits and underscores only. An expression named
+ * "high-five" (one ships in the seed data) makes setMyCommands 400, which
+ * takes down the whole menu and not just that one entry.
+ */
+const VALID_BOT_COMMAND = /^[a-z0-9_]{1,32}$/;
+
+/** setMyCommands accepts at most 100 commands per scope. */
+const MAX_BOT_COMMANDS = 100;
+
+/**
+ * Build the /commands menu. Exported for the tests: every name here has to
+ * satisfy Telegram's charset rule, and the only way to be sure of that without
+ * a live API call is to assert on this function's output.
+ */
+export function buildBotCommands(
+  expressions: Expression[],
+): Array<{ command: string; description: string }> {
+  const safe: Expression[] = [];
+  const lewd: Expression[] = [];
+  for (const expr of expressions) {
+    (expr.is_lewd ? lewd : safe).push(expr);
+  }
+
+  const cmds: Array<{ command: string; description: string }> = [
+    { command: 'start', description: 'Start the bot & show help' },
+    { command: 'help', description: 'Show this help message' },
+    { command: 'addexpression', description: 'Admin: add a new expression' },
+    { command: 'listexpressions', description: 'List all available expressions' },
+    { command: 'deleteexpression', description: 'Admin: delete an expression by name' },
+    { command: 'updatecaption', description: 'Admin: update caption template for an expression' },
+    { command: 'admins', description: 'List bot admins' },
+    { command: 'addadmin', description: 'Admin: add by user ID or replied message' },
+    { command: 'rmadmin', description: 'Admin: remove an admin by user ID' },
+    { command: 'mode', description: 'Admin: set expressions for GIF uploads' },
+    { command: 'rescan', description: 'Admin: re-index old channel posts by forwarding them here' },
+    { command: 'remove', description: 'Admin: remove a mistakenly uploaded GIF from the dump channel' },
+    { command: 'done', description: 'Admin: signal you are done uploading GIFs' },
+    { command: 'stats', description: 'Show usage stats per expression' },
+    { command: 'ping', description: 'Check bot uptime and latency' },
+    { command: 'sauce', description: 'Reverse search a replied image, GIF, video, or sticker' },
+  ];
+
+  if (safe.length > 0) {
+    cmds.push({ command: 'lewdmode', description: 'Toggle Lewd Mode (NSFW) in this chat' });
+  }
+
+  // Safe commands first, then lewd ones: the menu is truncated from the end if
+  // it overflows, and a lewd command is the one to lose.
+  for (const expr of [...safe, ...lewd]) {
+    cmds.push({ command: expr.name, description: `Send a random ${expr.name} GIF` });
+    for (const alias of expr.aliases) {
+      cmds.push({ command: alias, description: `Send a random ${expr.name} GIF (alias)` });
+    }
+  }
+
+  const valid = cmds.filter((c) => {
+    if (VALID_BOT_COMMAND.test(c.command)) return true;
+    // Not fatal: the expression still works as a typed command, it just cannot
+    // appear in the menu. Named here so the cause is findable.
+    console.warn(
+      `[commands] Skipping "/${c.command}" in the /commands menu: Telegram allows only 1-32 chars of a-z, 0-9 and _`,
+    );
+    return false;
+  });
+
+  if (valid.length > MAX_BOT_COMMANDS) {
+    console.warn(
+      `[commands] ${valid.length} commands exceeds Telegram's limit of ${MAX_BOT_COMMANDS}; dropping ${valid.length - MAX_BOT_COMMANDS}`,
+    );
+    return valid.slice(0, MAX_BOT_COMMANDS);
+  }
+  return valid;
+}
+
+/** Refresh the bot's command list from expressions in DB. */
+async function refreshBotCommands(bot: Bot<BotContext>): Promise<void> {
+  const expressions = await listExpressions();
+  const commands = buildBotCommands(expressions);
+  await bot.api.setMyCommands(commands);
+  console.log(`[commands] /commands menu updated (${commands.length} entries)`);
+}
+
+/**
+ * Whether the sender is the bot owner (full access).
+ */
+async function isBotOwner(userId: number | undefined): Promise<boolean> {
+  if (!userId) return false;
+  const config = loadConfig();
+  return config.BOT_OWNER_ID === userId;
+}
+
+/**
+ * Whether a user is a bot admin.
+ * Bot owner always has admin access.
+ *
+ * ADMIN_IDS is checked first and on purpose: those holders are not rows in the
+ * admins table, so a DB-only check locks a fresh deployment out of every admin
+ * command — including /addadmin, the one that would let someone in.
+ */
+async function isBotAdmin(userId: number | undefined): Promise<boolean> {
+  if (!userId) return false;
+  if (await isBotOwner(userId)) return true;
+  if (loadConfig().ADMIN_IDS.includes(userId)) return true;
+  return isAdmin(userId);
+}
+
+/**
+ * Whether the sender may manage per-chat settings (lock, bluetext, lewd mode)
+ * in this chat: group admins/owners always can; bot admins can everywhere.
+ */
+async function canManageChat(ctx: Context): Promise<boolean> {
+  if (!ctx.from) return false;
+  const chatType = ctx.chat?.type;
+  if (chatType === 'private') return true; // users manage their own PM settings
+  if (chatType !== 'group' && chatType !== 'supergroup') return false;
+  try {
+    const member = await ctx.getChatMember(ctx.from.id);
+    if (member.status === 'administrator' || member.status === 'creator') return true;
+  } catch (err) {
+    logApiError('canManageChat', err, { chat_id: ctx.chat?.id, user_id: ctx.from.id });
+    // Fall through to bot-admin check
+  }
+  return isBotAdmin(ctx.from.id);
+}
+
+/**
+ * Send one of the built HTML messages.
+ *
+ * Centralised so that a message the length cap truncated is always logged:
+ * silently dropping the tail of /help as expressions are added is exactly the
+ * kind of thing nobody notices until someone asks why a command is missing.
+ */
+async function sendHtml(ctx: Context, label: string, built: BuiltMessage): Promise<void> {
+  if (built.dropped > 0) {
+    console.warn(
+      `[${label}] Message hit Telegram's length cap; ${built.dropped} line(s) dropped`,
+    );
+  }
+  await ctx.reply(built.text, { parse_mode: 'HTML' });
+}
+
+/** Create bot instance and configure middleware */
+export function createBot() {
+  const config = loadConfig();
+  const bot = new Bot<BotContext>(config.BOT_TOKEN);
+
+  // ---- Session middleware (database-backed for polling and serverless runtimes) ----
+  const storage = {
+    read: loadSession,
+    write: flushSession,
+    delete: deleteSession,
+  } as any;
+  bot.use(session({
+    initial: (): BotContext['session'] => ({}),
+    storage,
+    getSessionKey: (ctx) => {
+      if (ctx.chat?.type !== 'private' || !ctx.from) return undefined;
+      return `${ctx.chat.id}:${ctx.from.id}`;
+    },
+  }) as any);
+
+  // ---- Error handling ----
+  bot.catch((err) => {
+    const ctx = err.ctx;
+    // Which update caused it is as important as the error: without this, a
+    // recurring failure cannot be tied to a command, chat, or user.
+    logApiError('unhandled', err.error, {
+      update_id: ctx.update.update_id,
+      update_type: Object.keys(ctx.update).filter((k) => k !== 'update_id').join(','),
+      chat_id: ctx.chat?.id,
+      from_id: ctx.from?.id,
+      text: ctx.message?.text?.slice(0, 120),
+    });
+    if (ctx.chat) {
+      ctx.reply(
+        '❌ An internal error occurred. The admins have been notified.',
+      ).catch((replyErr) => logApiError('unhandled:reply', replyErr));
+    }
+  });
+
+  // ---- Command: /start & /help ----
+  bot.command(['start', 'help'], async (ctx) => {
+    const isAdminUser = await isBotAdmin(ctx.from?.id);
+    const isOwnerUser = await isBotOwner(ctx.from?.id);
+    const isStart = ctx.message?.text?.split(/\s+/)[0]?.split('@')[0] === '/start';
+    const built = isStart ? buildStartMessage(isAdminUser, isOwnerUser) : buildMainMenuMessage();
+    const keyboardRows: Array<Array<{ text: string; callback_data: string }>> = isStart
+      ? [[{ text: '📖 Help Menu', callback_data: CALLBACK_DATA.HELP_MENU }]]
+      : [
+          [{ text: '👤 User Commands', callback_data: CALLBACK_DATA.USER_COMMANDS }],
+          ...((isAdminUser || isOwnerUser)
+            ? [[{ text: '⚙️ Bot Admin Panel', callback_data: CALLBACK_DATA.BOT_ADMIN }]]
+            : []),
+          [{ text: '👥 Group Admin Panel', callback_data: CALLBACK_DATA.GROUP_ADMIN }],
+          [{ text: '📊 Stats', callback_data: CALLBACK_DATA.STATS }],
+        ];
+
+    await ctx.reply(quoteMenuText(built.text), {
+      parse_mode: 'HTML' as const,
+      reply_markup: { inline_keyboard: keyboardRows },
+    });
+  });
+
+  // ---- Callback query handler for menu navigation ----
+  bot.on('callback_query', async (ctx) => {
+    const data = ctx.callbackQuery?.data;
+    if (!data) return;
+
+    const isAdminUser = await isBotAdmin(ctx.from?.id);
+    const isOwnerUser = await isBotOwner(ctx.from?.id);
+    const expressions = await listExpressions();
+    const hasLewd = expressions.some((e) => e.is_lewd);
+
+    type InlineKeyboard = { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+
+    let text: string;
+    let replyMarkup: InlineKeyboard;
+
+    switch (data) {
+      case CALLBACK_DATA.USER_COMMANDS: {
+        const userRows: Array<Array<{ text: string; callback_data: string }>> = [
+          [{ text: '◀️ Back to Menu', callback_data: CALLBACK_DATA.BACK_TO_MENU }],
+        ];
+        if (hasLewd) {
+          userRows.unshift([{ text: '🔞 Lewd Commands', callback_data: CALLBACK_DATA.LEWD_COMMANDS }]);
+        }
+        replyMarkup = { inline_keyboard: userRows };
+        text = buildUserCommandsPanel(expressions).text;
+        break;
+      }
+
+      case CALLBACK_DATA.BOT_ADMIN:
+        text = isAdminUser || isOwnerUser
+          ? buildBotAdminPanel(isOwnerUser).text
+          : '⛔ <b>Access Denied</b>\n\nYou need bot admin privileges to view this panel.';
+        replyMarkup = {
+          inline_keyboard: [
+            [{ text: '◀️ Back to Menu', callback_data: CALLBACK_DATA.BACK_TO_MENU }],
+          ],
+        };
+        break;
+
+      case CALLBACK_DATA.GROUP_ADMIN:
+        text = buildGroupAdminPanel().text;
+        replyMarkup = {
+          inline_keyboard: [
+            [{ text: '◀️ Back to Menu', callback_data: CALLBACK_DATA.BACK_TO_MENU }],
+          ],
+        };
+        break;
+
+      case CALLBACK_DATA.STATS: {
+        const stats = await getMediaStats();
+        text = stats.length > 0
+          ? buildStatsMessageText(stats)
+          : '📊 <b>Usage Statistics</b>\n\nNo GIFs have been used yet.';
+        replyMarkup = {
+          inline_keyboard: [
+            [{ text: '◀️ Back to Menu', callback_data: CALLBACK_DATA.BACK_TO_MENU }],
+          ],
+        };
+        break;
+      }
+
+      case CALLBACK_DATA.LEWD_COMMANDS:
+        text = buildLewdCommandsPanel(expressions).text;
+        replyMarkup = {
+          inline_keyboard: [
+            [{ text: '◀️ Back to User Commands', callback_data: CALLBACK_DATA.USER_COMMANDS }],
+          ],
+        };
+        break;
+
+      case CALLBACK_DATA.BACK_TO_MENU:
+      case CALLBACK_DATA.HELP_MENU:
+      default: {
+        text = buildMainMenuMessage().text;
+        const menuRows: Array<Array<{ text: string; callback_data: string }>> = [
+          [{ text: '👤 User Commands', callback_data: CALLBACK_DATA.USER_COMMANDS }],
+        ];
+        if (isAdminUser || isOwnerUser) {
+          menuRows.push([{ text: '⚙️ Bot Admin Panel', callback_data: CALLBACK_DATA.BOT_ADMIN }]);
+        }
+        menuRows.push([{ text: '👥 Group Admin Panel', callback_data: CALLBACK_DATA.GROUP_ADMIN }]);
+        menuRows.push([{ text: '📊 Stats', callback_data: CALLBACK_DATA.STATS }]);
+        replyMarkup = { inline_keyboard: menuRows };
+        break;
+      }
+    }
+
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(quoteMenuText(text), {
+      parse_mode: 'HTML' as const,
+      reply_markup: replyMarkup,
+    });
+  });
+
+  // ---- Command: /listexpressions ----
+  bot.command('listexpressions', async (ctx) => {
+    const expressions = await listExpressions();
+    if (expressions.length === 0) {
+      await ctx.reply('No expressions configured.');
+      return;
+    }
+    await sendHtml(ctx, 'listexpressions', buildExpressionListMessage(expressions));
+  });
+
+  // ---- Command: /stats ----
+  bot.command('stats', async (ctx) => {
+    const stats = await getMediaStats();
+    if (stats.length === 0) {
+      await ctx.reply('No media uploaded yet.');
+      return;
+    }
+    await sendHtml(ctx, 'stats', buildStatsMessage(stats));
+  });
+
+  // ---- Command: /ping ----
+  bot.command('ping', async (ctx) => {
+    const start = Date.now();
+    // Send initial "Pong!" message
+    const pongMsg = await ctx.reply('🏓 Pong!').catch(() => null);
+    const latency = Date.now() - start;
+    const uptime = formatUptime(Date.now() - PROCESS_START_TIME);
+
+    const response = `🏓 <b>Pong!</b>\n\n📊 <b>Uptime:</b> ${uptime}\n⚡ <b>Latency:</b> ${latency}ms`;
+
+    if (pongMsg) {
+      await ctx.api.editMessageText(
+        ctx.chat!.id,
+        pongMsg.message_id,
+        response,
+        { parse_mode: 'HTML' as const },
+      ).catch(() => {
+        // If edit fails (e.g., message too old), send new message
+        ctx.reply(response, { parse_mode: 'HTML' as const }).catch(() => {});
+      });
+    } else {
+      await ctx.reply(response, { parse_mode: 'HTML' as const }).catch(() => {});
+    }
+  });
+
+  // ---- Admin: add expression ----
+  bot.command('addexpression', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only admins can add expressions.');
+      return;
+    }
+    const text = ctx.match?.trim() ?? '';
+    if (!text) {
+      await ctx.reply(
+        'Usage: /addexpression <name> [alias1,alias2,...] [-u|--uni]\n' +
+        'Add -u or --uni for unidirectional expressions (smile, wave, stare …)\n' +
+        'Example: /addexpression hug hugs cuddle\n' +
+        'Example: /addexpression smile smiles -u',
+      );
+      return;
+    }
+
+    // Split on whitespace, but treat -u/--uni as its own token
+    const tokens = text.split(/\s+/);
+    const directionFlag = tokens[tokens.length - 1];
+    const isUnidirectional =
+      directionFlag === '-u' || directionFlag === '--uni';
+
+    const cleanTokens = isUnidirectional ? tokens.slice(0, -1) : tokens;
+    const name = cleanTokens[0]?.toLowerCase() ?? '';
+    const aliases = cleanTokens.slice(1).map((a) => a.toLowerCase());
+
+    if (!name) {
+      await ctx.reply('Usage: /addexpression <name> [alias1,alias2,...] [-u|--uni]');
+      return;
+    }
+
+    // Rejected here rather than at setMyCommands, which fails for the whole
+    // menu rather than for the one bad name: "high-five" is the usual case.
+    const invalid = [name, ...aliases].filter((n) => !VALID_BOT_COMMAND.test(n));
+    if (invalid.length > 0) {
+      await ctx.reply(
+        `❌ Not usable as a command: ${invalid.join(', ')}\nUse 1-32 characters of a-z, 0-9 and _ (no dashes).`,
+      );
+      return;
+    }
+
+    try {
+      await createExpression(name, aliases, undefined, isUnidirectional ? 'unidirectional' : 'bidirectional');
+    } catch (err: any) {
+      if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        await ctx.reply(`❌ Expression /${name} already exists.`);
+      } else {
+        console.error('[addexpression] Failed to create expression:', err);
+        await ctx.reply('❌ Failed to add expression.');
+      }
+      return;
+    }
+
+    const dirNote = isUnidirectional
+      ? ' (unidirectional — needs "at" in template or will auto-inject it)'
+      : '';
+    await ctx.reply(
+      `✅ Expression /${name} added${aliases.length ? ` with aliases: ${aliases.join(', ')}` : ''}${dirNote}.`,
+    );
+
+    // Outside the try above: the expression exists either way, so a failed
+    // menu refresh must not report the add itself as failed.
+    try {
+      await refreshBotCommands(bot);
+    } catch (err) {
+      logApiError('addexpression:refresh', err);
+      await ctx.reply('⚠️ Expression added, but the /commands menu could not be refreshed.');
+    }
+  });
+
+  // ---- Admin: delete expression ----
+  bot.command('deleteexpression', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only admins can delete expressions.');
+      return;
+    }
+    const name = (ctx.match?.trim() ?? '').toLowerCase();
+    if (!name) {
+      await ctx.reply('Usage: /deleteexpression <name>');
+      return;
+    }
+    const deleted = await deleteExpression(name);
+    if (!deleted) {
+      await ctx.reply(`❌ Expression /${name} not found.`);
+      return;
+    }
+    await ctx.reply(`✅ Expression /${name} deleted.`);
+    try {
+      await refreshBotCommands(bot);
+    } catch (err) {
+      logApiError('deleteexpression:refresh', err);
+      await ctx.reply('⚠️ Expression deleted, but the /commands menu could not be refreshed.');
+    }
+  });
+
+  // ---- Admin: update caption template ----
+  bot.command('updatecaption', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only admins can update caption templates.');
+      return;
+    }
+    const match = ctx.match?.trim();
+    if (!match) {
+      await ctx.reply(
+        'Usage: /updatecaption <expression> <caption template>\n' +
+        'Placeholders: {from}, {to}, {action}\n' +
+        'Examples:\n' +
+        '/updatecaption hug {from} hugs {to}! 🤗\n' +
+        '/updatecaption smile {from} smiles.',
+      );
+      return;
+    }
+    const split = match.split(/\s+/);
+    const name = split[0].toLowerCase();
+    const template = split.slice(1).join(' ');
+    if (!template) {
+      await ctx.reply('Please provide a caption template.');
+      return;
+    }
+    const ok = await updateCaptionTemplate(name, template);
+    if (ok) {
+      await ctx.reply(`✅ Caption template for /${name} updated.`);
+    } else {
+      await ctx.reply(`❌ Expression /${name} not found.`);
+    }
+  });
+
+  // ---- Admin: add admin ----
+  bot.command('addadmin', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only admins can add admins.');
+      return;
+    }
+    const raw = ctx.match?.trim() ?? '';
+    const repliedUser = ctx.message?.reply_to_message?.from;
+    if (!raw && !repliedUser) {
+      await ctx.reply('Usage: /addadmin <user_id> or reply to a user message with /addadmin.');
+      return;
+    }
+    let userId: number;
+    let username: string | null = raw ? null : repliedUser?.username ?? null;
+    if (!raw && repliedUser) {
+      if (repliedUser.is_bot) {
+        await ctx.reply('❌ Bot accounts cannot be added as admins.');
+        return;
+      }
+      userId = repliedUser.id;
+    } else if (raw.startsWith('@')) {
+      await ctx.reply('Telegram bots cannot resolve arbitrary usernames to user IDs. Use /addadmin <user_id> or reply to that user’s message with /addadmin.');
+      return;
+    } else {
+      const parsed = Number(raw);
+      if (!Number.isInteger(parsed) || parsed <= 0) {
+        await ctx.reply('❌ User ID must be a positive integer.');
+        return;
+      }
+      userId = parsed;
+    }
+    try {
+      await addAdmin(userId, username, ctx.from?.id ?? 0);
+      await ctx.reply(`✅ User ${username ? `@${username}` : userId} added as admin.`);
+    } catch (err) {
+      console.error('[addadmin] Failed to add admin:', err);
+      await ctx.reply('❌ Failed to add admin.');
+    }
+  });
+
+  // ---- Admin: remove admin ----
+  bot.command('rmadmin', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only admins can remove admins.');
+      return;
+    }
+    const raw = (ctx.match?.trim() ?? '');
+    if (!raw) {
+      await ctx.reply('Usage: /rmadmin <user_id>');
+      return;
+    }
+    if (raw.startsWith('@')) {
+      await ctx.reply('Please use numeric user ID, not @username, to remove an admin.');
+      return;
+    }
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+      await ctx.reply('❌ User ID must be a positive integer.');
+      return;
+    }
+    const userId = parsed;
+    if (userId === (ctx.from?.id ?? 0)) {
+      await ctx.reply('❌ You cannot remove yourself as admin.');
+      return;
+    }
+    // removeAdmin only deletes a row, so for an ADMIN_IDS holder it would
+    // report success and change nothing.
+    if (loadConfig().ADMIN_IDS.includes(userId)) {
+      await ctx.reply(
+        `❌ User ${userId} is an admin via the ADMIN_IDS environment variable. Remove them there and restart the bot.`,
+      );
+      return;
+    }
+    try {
+      const removed = await removeAdmin(userId);
+      if (removed) {
+        await ctx.reply(`✅ User ${userId} removed from admins.`);
+      } else {
+        await ctx.reply(`❌ User ${userId} was not an admin.`);
+      }
+    } catch (err) {
+      console.error('[rmadmin] Failed to remove admin:', err);
+      await ctx.reply('❌ Failed to remove admin.');
+    }
+  });
+
+  // ---- Admin: list admins ----
+  bot.command('admins', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only admins can view the admin list.');
+      return;
+    }
+    const admins = await listAdmins();
+    const envAdminIds = loadConfig().ADMIN_IDS;
+    if (admins.length === 0 && envAdminIds.length === 0) {
+      await ctx.reply('No admins found.');
+      return;
+    }
+    await sendHtml(ctx, 'admins', buildAdminsMessage(admins, envAdminIds));
+  });
+
+  // ---- Admin: download LINE sticker/emoji packs as ZIP files ----
+  bot.command('linepack', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only bot admins can use /linepack.');
+      return;
+    }
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply('Use /linepack in a private chat with the bot so the ZIP is sent privately.');
+      return;
+    }
+
+    const [rawUrl, rawFormat] = (ctx.match?.trim() ?? '').split(/\s+/);
+    const pack = rawUrl ? parseLinePackUrl(rawUrl) : null;
+    if (!pack) {
+      await ctx.reply(
+        'Usage: /linepack <LINE pack URL> [static|animated]\n\n' +
+        'Supports LINE sticker and emoji pack links. Sticker packs default to static; add “animated” for an animated pack when available. Emoji packs are static.',
+      );
+      return;
+    }
+
+    const format = (rawFormat?.toLowerCase() || 'static') as 'static' | 'animated';
+    if (format !== 'static' && format !== 'animated') {
+      await ctx.reply('Choose either “static” or “animated”.');
+      return;
+    }
+    if (pack.kind === 'emoji' && format === 'animated') {
+      await ctx.reply('Emoji pack ZIPs are currently available as static packs only.');
+      return;
+    }
+
+    const status = await ctx.reply('⏳ Fetching the LINE pack ZIP…');
+    try {
+      const result = await downloadLinePackZip(pack, format);
+      await ctx.api.sendDocument(
+        ctx.chat.id,
+        new InputFile(result.buffer, result.filename),
+        { reply_parameters: { message_id: ctx.msg.message_id } },
+      );
+      await ctx.api.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
+    } catch (err) {
+      console.error('[linepack] Failed to download LINE pack:', err);
+      const message = err instanceof Error ? err.message : 'Could not download this LINE pack.';
+      await ctx.api.editMessageText(ctx.chat.id, status.message_id, `❌ ${message}`).catch(async () => {
+        await ctx.reply(`❌ ${message}`);
+      });
+    }
+  });
+
+  // ---- Admin: create a Telegram sticker/custom emoji pack from a LINE pack ----
+  bot.command('linepackcreate', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only bot admins can use /linepackcreate.');
+      return;
+    }
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply('Use /linepackcreate in a private chat with the bot.');
+      return;
+    }
+
+    const commandText = ctx.match?.trim() ?? '';
+    const separatorIndex = commandText.indexOf('|');
+    const hasTitle = separatorIndex !== -1;
+    const rawPackArguments = (hasTitle ? commandText.slice(0, separatorIndex) : commandText).trim().split(/\s+/).filter(Boolean);
+    const recreateExisting = rawPackArguments.includes('--recreate');
+    const packArguments = rawPackArguments.filter((argument) => argument !== '--recreate');
+    const customTitle = hasTitle ? commandText.slice(separatorIndex + 1).trim() : undefined;
+    const [rawUrl, requestedEmoji] = packArguments;
+    const pack = rawUrl ? parseLinePackUrl(rawUrl) : null;
+    if (!pack || packArguments.length > 2 || (hasTitle && !customTitle)) {
+      await ctx.reply(
+        'Usage: /linepackcreate <LINE pack URL> [emoji] [--recreate] | [custom pack name]\n\n' +
+          'Example: /linepackcreate https://store.line.me/stickershop/product/27642/en 🎉 | Spy Family Reactions\n\n' +
+          'Add --recreate before | only if Telegram says the existing pack cannot be found; it deletes and rebuilds the bot-created pack. ' +
+          'Creates static Telegram pack(s) from a LINE sticker or emoji pack. Large packs are split to Telegram’s pack-size limit and filled automatically in batches. ' +
+        'Animated LINE packs can still be downloaded with /linepack <URL> animated.\n' +
+        'Use /linepack <URL> to download the original ZIP instead.',
+      );
+      return;
+    }
+
+    if (customTitle && ([...customTitle].length > 64 || /[\u0000-\u001f\u007f]/.test(customTitle))) {
+      await ctx.reply('❌ The custom pack name must be 1–64 characters and cannot contain control characters.');
+      return;
+    }
+
+    const emoji = requestedEmoji || (pack.kind === 'emoji' ? '🙂' : '🎉');
+    if (emoji.length > 32 || /\s/.test(emoji)) {
+        await ctx.reply('Use one emoji without spaces, for example /linepackcreate <LINE pack URL> 🎉 | My Sticker Pack.');
+      return;
+    }
+
+    const status = await ctx.reply(recreateExisting
+      ? '⏳ Rebuilding the Telegram pack…'
+      : '⏳ Downloading and preparing the LINE pack for Telegram…');
+    try {
+      const [download, me] = await Promise.all([
+        downloadLinePackZip(pack, 'static'),
+        ctx.api.getMe(),
+      ]);
+      if (!me.username || !ctx.from) throw new Error('The bot or admin account could not be identified.');
+
+      let lastProgressEdit = 0;
+      const result = await createLineTelegramPack(
+        ctx.api,
+        pack,
+        download.buffer,
+        ctx.from.id,
+        me.username,
+        emoji,
+        customTitle,
+        async (progress) => {
+          const now = Date.now();
+          if (now - lastProgressEdit < 1_500 && progress.completed < progress.total) return;
+          lastProgressEdit = now;
+          const ratio = progress.total > 0 ? progress.completed / progress.total : 0;
+          const filled = Math.min(12, Math.floor(ratio * 12));
+          const bar = `${'█'.repeat(filled)}${'░'.repeat(12 - filled)}`;
+          const action = progress.phase === 'preparing' ? 'Preparing' : 'Adding to';
+          const text = `⏳ ${action} ${progress.packTitle} (${progress.partNumber}/${progress.partCount})\n` +
+            `${bar} ${Math.floor(ratio * 100)}%\n${progress.completed}/${progress.total} stickers`;
+          await ctx.api.editMessageText(ctx.chat.id, status.message_id, text).catch(() => {});
+        },
+        recreateExisting,
+      );
+      const progress = result.parts.reduce((sum, part) => sum + Math.min(part.count, part.total), 0);
+      const partLinks = result.parts.filter((part) => part.count > 0).map((part) =>
+        `${part.title} — ${part.count}/${part.total}\n${part.url}`,
+      ).join('\n');
+      const message = result.completed
+        ? `✅ Created ${result.parts.length} Telegram pack${result.parts.length === 1 ? '' : 's'} with all ${result.total} stickers.\n\n${partLinks}`
+        : `⏳ Pack creation progress: ${progress}/${result.total} stickers.\n` +
+            `${result.timeBudgetReached ? 'This pack exceeded one Vercel request’s time limit.' : 'The pack is not finished yet.'} ` +
+            `Send the same /linepackcreate command again to resume from saved progress.\n${partLinks}`;
+      await ctx.api.editMessageText(ctx.chat.id, status.message_id, message, { link_preview_options: { is_disabled: true } });
+    } catch (err) {
+      console.error('[linepackcreate] Failed to create Telegram pack:', err);
+      const message = err instanceof Error ? err.message : 'Could not create this Telegram pack.';
+      await ctx.api.editMessageText(ctx.chat.id, status.message_id, `❌ ${message}`).catch(async () => {
+        await ctx.reply(`❌ ${message}`);
+      });
+    }
+  });
+
+  // ---- Admin: set mode (one or more expressions for caption-free uploads) ----
+  bot.command('mode', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only admins can use /mode.');
+      return;
+    }
+    const requestedNames = (ctx.match?.trim() ?? '')
+      .split(/[\s,]+/)
+      .map((name) => name.replace(/^#/, '').toLowerCase())
+      .filter(Boolean);
+    if (requestedNames.length === 0) {
+      await ctx.reply('Usage: /mode <expression> [expression ...]\nExample: /mode hug kiss');
+      return;
+    }
+    if (requestedNames.includes('lewd')) {
+      await ctx.reply('Use #lewd in an individual GIF caption to mark that upload as lewd. /mode accepts expression names only.');
+      return;
+    }
+    const expressions = new Map<string, Expression>();
+    const unknown: string[] = [];
+    for (const name of requestedNames) {
+      const expression = await getExpressionByName(name);
+      if (expression) expressions.set(expression.name, expression);
+      else unknown.push(name);
+    }
+    if (unknown.length > 0) {
+      await ctx.reply(`❌ Unknown expression${unknown.length === 1 ? '' : 's'}: ${unknown.map((name) => `/${name}`).join(', ')}.`);
+      return;
+    }
+    const activeExpressions = [...expressions.values()];
+    const activeNames = activeExpressions.map((expression) => expression.name);
+    ctx.session!.activeExpressions = activeNames;
+    ctx.session!.activeExpression = activeNames[0];
+    await ctx.reply(
+      `✅ Active expressions set to ${activeNames.map((name) => `/${name}`).join(', ')}. Each GIF you upload will be tagged with all of them.\n\n` +
+      `💬 Each reaction command keeps its own caption template, even when a GIF has many tags. Admins can edit any with /updatecaption &lt;expression&gt; &lt;template&gt; (placeholders: {from}, {to}, {action}).\n` +
+      `💡 <b>Tips:</b> Upload in batches (5–10 at a time) with a short pause between batches to avoid rate limiting. ` +
+      `To remove a mistaken upload, send /remove to see the numbered list, then /remove &lt;number&gt;. Send /done when finished.`,
+      { parse_mode: 'HTML' },
+    );
+  });
+
+  // ---- Admin: signal done uploading ----
+  bot.command('done', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) return;
+    const wasRescan = ctx.session?.rescanActive ?? false;
+    const rescannedCount = ctx.session?.rescannedCount ?? 0;
+    const duplicateCount = wasRescan ? (ctx.session?.uploadedItems?.length ?? 0) : 0;
+    const count = ctx.session?.uploadedCount ?? 0;
+    const expressions = ctx.session?.activeExpressions ?? (ctx.session?.activeExpression ? [ctx.session.activeExpression] : []);
+    // Clear the active expression from session and delete the session entry
+    if (ctx.session) {
+      ctx.session.activeExpression = undefined;
+      ctx.session.activeExpressions = undefined;
+      ctx.session.uploadedCount = undefined;
+      if (wasRescan) {
+        ctx.session.rescanActive = undefined;
+        ctx.session.rescanMode = undefined;
+        ctx.session.rescannedCount = undefined;
+        if (duplicateCount === 0) ctx.session.uploadedItems = undefined;
+      } else {
+        ctx.session.uploadedItems = undefined;
+      }
+    }
+    // Keep the duplicate list after reindexing so /remove can clean up the
+    // flagged channel posts. All other finished sessions are discarded.
+    if (!wasRescan || duplicateCount === 0) ctx.session = undefined;
+
+    if (wasRescan) {
+      await ctx.reply(
+        `✅ Reindex finished. Processed ${rescannedCount} forwarded post${rescannedCount === 1 ? '' : 's'}.` +
+        (duplicateCount > 0 ? `\n\nFound ${duplicateCount} duplicate channel post${duplicateCount === 1 ? '' : 's'}. Use /remove to review them or /remove all to delete only those duplicate posts.` : ''),
+      );
+      return;
+    }
+    if (count === 0) {
+      await ctx.reply('✅ Upload session ended. No GIFs were uploaded this session.');
+      return;
+    }
+    const tagText = expressions.length ? ` with ${expressions.map((name) => `/${name}`).join(', ')}` : '';
+    await ctx.reply(
+      `✅ <b>Upload complete!</b>\n\n` +
+      `📤 <b>${count}</b> GIF${count === 1 ? '' : 's'} forwarded to channel${tagText}.\n\n` +
+      `Ready for another batch — send /mode &lt;expression&gt; [expression ...] to start.`,
+      { parse_mode: 'HTML' },
+    );
+  });
+
+  // ---- Admin: remove a mistakenly uploaded GIF from the dump channel ----
+  bot.command('remove', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) return;
+
+    const items = ctx.session?.uploadedItems ?? [];
+    const count = items.length;
+
+    if (count === 0) {
+      await ctx.reply('No GIFs in the current upload session to remove.');
+      return;
+    }
+
+    const arg = (ctx.match?.trim() ?? '').toLowerCase();
+    const channelId = config.DUMP_CHANNEL_ID;
+    if (!channelId) {
+      await ctx.reply('❌ No DUMP_CHANNEL_ID is configured.');
+      return;
+    }
+
+    if (arg === 'all') {
+      let deleted = 0;
+      const remaining: typeof items = [];
+      const removed: typeof items = [];
+      const failed: Array<{ messageId: number; reason: string }> = [];
+      for (const item of [...items]) {
+        try {
+          await ctx.api.deleteMessage(channelId, item.channelMsgId);
+        } catch (err) {
+          const reason = err instanceof GrammyError ? err.description : (err as Error).message;
+          failed.push({ messageId: item.channelMsgId, reason });
+          remaining.push(item);
+          continue;
+        }
+        deleted++;
+        removed.push(item);
+        await sleep(200);
+      }
+      await cleanupRemovedUploadItems(removed, remaining);
+      ctx.session!.uploadedItems = remaining;
+      ctx.session!.uploadedCount = Math.max(0, (ctx.session!.uploadedCount ?? count) - deleted);
+      let report = `🗑️ Deleted ${deleted} of ${count} GIF${count === 1 ? '' : 's'} from the channel.`;
+      if (failed.length > 0) {
+        const failedIds = failed.slice(0, 15).map((item) => `#${item.messageId}`).join(', ');
+        const more = failed.length > 15 ? ` and ${failed.length - 15} more` : '';
+        const reason = failed[0].reason;
+        const likelyAgeLimit = /message can't be deleted/i.test(reason);
+        report += `\nCould not delete ${failed.length}: ${failedIds}${more}.`;
+        report += likelyAgeLimit
+          ? '\nTelegram usually returns this when a post is older than 48 hours. Delete those posts manually in the channel; the bot API cannot remove them.'
+          : `\nTelegram says: ${reason}. Check that the bot has permission to delete channel messages, or delete these posts manually.`;
+      }
+      await ctx.reply(report);
+      return;
+    }
+
+    // Parse index (1-based) from the argument
+    const index = Number.parseInt(arg, 10);
+
+    if (!arg || isNaN(index) || index < 1 || index > count) {
+      const list = items
+        .map((item, i) => `  ${i + 1}. channel post #${item.channelMsgId}${item.duplicateOfChannelMsgId ? ` (duplicate of #${item.duplicateOfChannelMsgId})` : ''}`)
+        .join('\n');
+      await ctx.reply(
+        `<b>Uploaded GIFs (${count}):</b>\n${list}\n\n` +
+        `Reply with /remove &lt;number&gt; to delete one, or /remove all to delete all.`,
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+
+    // Delete one by index
+    const item = items[index - 1];
+    try {
+      await ctx.api.deleteMessage(channelId, item.channelMsgId);
+    } catch (err) {
+      const reason = err instanceof GrammyError ? err.description : (err as Error).message;
+      const detail = /message can't be deleted/i.test(reason)
+        ? 'Telegram usually means the post is older than 48 hours. Delete it manually in the channel; the bot API cannot remove it.'
+        : `Telegram says: ${reason}. Check that the bot has permission to delete channel messages.`;
+      await ctx.reply(`❌ Could not delete channel post #${item.channelMsgId}. ${detail}`);
+      return;
+    }
+    const remaining = items.filter((_, itemIndex) => itemIndex !== index - 1);
+    await cleanupRemovedUploadItems([item], remaining);
+    ctx.session!.uploadedItems = remaining;
+    ctx.session!.uploadedCount = Math.max(0, (ctx.session!.uploadedCount ?? 1) - 1);
+    await ctx.reply(`🗑️ Deleted GIF #${index} from channel.`);
+  });
+
+  // Bot API has no channel-history endpoint. Admins restore the index by
+  // forwarding old channel posts; duplicates are tracked for optional removal.
+  bot.command('rescan', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only bot admins can run /rescan.').catch(() => {});
+      return;
+    }
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply('Run /rescan in a private chat with the bot, then forward the old channel posts here.');
+      return;
+    }
+    const arg = (ctx.match?.trim() ?? '').toLowerCase();
+    if (arg === 'off') {
+      if (ctx.session) {
+        ctx.session.rescanActive = undefined;
+        ctx.session.rescanMode = undefined;
+        ctx.session.rescannedCount = undefined;
+      }
+      await ctx.reply('Reindex mode stopped.');
+      return;
+    }
+    ctx.session!.activeExpression = undefined;
+    ctx.session!.activeExpressions = undefined;
+    ctx.session!.rescanActive = true;
+    ctx.session!.rescanMode = arg === 'relink' ? 'relink' : 'index';
+    ctx.session!.rescannedCount = 0;
+    ctx.session!.uploadedItems = [];
+    const rescanPrompt = arg === 'relink'
+      ? '🔗 <b>Relink mode is on.</b> Forward only the posts you are keeping; I will update each GIF record to point to that surviving channel post. Send /done when finished, or /rescan off to stop.'
+      : '📥 <b>Reindex mode is on.</b> Forward the original batch first, then the reuploaded batch. I will rebuild the index, restore hashtag tags, and flag duplicates for optional removal without reposting. Send /done when finished, or /rescan off to stop.';
+    await ctx.reply(rescanPrompt, { parse_mode: 'HTML' });
+  });
+
+  // ---- Admin: toggle expression lewd/safe ----
+  bot.command('togglelewd', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only admins can toggle lewd/safe.');
+      return;
+    }
+    const name = (ctx.match?.trim() ?? '').toLowerCase();
+    if (!name) {
+      await ctx.reply('Usage: /togglelewd <expression>\nExample: /togglelewd kiss');
+      return;
+    }
+    const expression = await getExpressionByName(name);
+    if (!expression) {
+      await ctx.reply(`❌ Unknown expression /${name}.`);
+      return;
+    }
+    const nowLewd = !(expression.is_lewd === 1);
+    const success = await toggleExpressionLewd(name, nowLewd);
+    if (success) {
+      await ctx.reply(`✅ Expression /${name} is now ${nowLewd ? 'lewd' : 'safe'}.`);
+    } else {
+      await ctx.reply('❌ Failed to toggle lewd/safe.');
+    }
+  });
+
+  // ---- Admin: scan & merge visual duplicates ----
+  bot.command('dedupe', async (ctx) => {
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Only admins can run deduplication.');
+      return;
+    }
+    const processing = await ctx.reply('🔍 Scanning for duplicate GIFs…');
+
+    let totalMerged = 0;
+    let batchScanned = 0;
+    const SCAN_CAP = 500;
+
+    try {
+      const result = await getDb().execute({
+        sql: 'SELECT id, file_id, file_unique_id, phash, usage_count, is_lewd, created_at FROM media WHERE phash IS NOT NULL ORDER BY id LIMIT ?',
+        args: [SCAN_CAP],
+      });
+
+      const rows = result.rows as unknown as Array<{ id: number; file_id: string; file_unique_id: string; phash: string; usage_count: number; is_lewd: number; created_at: string }>;
+      batchScanned = rows.length;
+
+      // Group rows by visual similarity using union-find
+      const parent = new Map<number, number>();
+      const find = (x: number): number => {
+        if (!parent.has(x)) parent.set(x, x);
+        if (parent.get(x) !== x) parent.set(x, find(parent.get(x)!));
+        return parent.get(x)!;
+      };
+
+      for (let i = 0; i < rows.length; i++) {
+        for (let j = i + 1; j < rows.length; j++) {
+          const dist = hammingDistance(rows[i].phash, rows[j].phash);
+          if (dist >= 0 && dist <= 8) {
+            const pi = find(rows[i].id);
+            const pj = find(rows[j].id);
+            if (pi !== pj) parent.set(pi, pj);
+          }
+        }
+      }
+
+      // Build groups: primary = lowest id in each group
+      const groups = new Map<number, number[]>();
+      for (const row of rows) {
+        const root = find(row.id);
+        if (!groups.has(root)) groups.set(root, []);
+        groups.get(root)!.push(row.id);
+      }
+
+      for (const [, ids] of groups) {
+        if (ids.length < 2) continue;
+        // Sort by id asc → primary = lowest id
+        ids.sort((a, b) => a - b);
+        const [primaryId, ...duplicateIds] = ids;
+        for (const dupId of duplicateIds) {
+          try {
+            await mergeMedia(primaryId, dupId);
+            totalMerged++;
+          } catch {
+            /* row may already be gone or links moved by a prior run */
+          }
+        }
+      }
+
+      const hitCap = batchScanned >= SCAN_CAP;
+      await ctx.api.editMessageText(
+        processing.chat.id,
+        processing.message_id,
+        `✅ Merged ${totalMerged} duplicate GIF${totalMerged === 1 ? '' : 's'} into the oldest copy.`
+        + (hitCap ? ' (capped at ' + batchScanned + ' rows — run again to continue).' : ''),
+      );
+    } catch (err) {
+      logApiError('dedupe', err);
+      await ctx.api.editMessageText(processing.chat.id, processing.message_id, '❌ Deduplication failed. Check logs.').catch(() => {});
+    } finally {
+      // No temporary dir created in this handler.
+    }
+  });
+
+  // ---- Chat: toggle lewd mode (NSFW) ----
+  bot.command('lewdmode', async (ctx) => {
+    const arg = (ctx.match?.trim() ?? '').toLowerCase();
+
+    // Permission: group admins/owners or bot admins (anyone in PM)
+    if (!(await canManageChat(ctx))) {
+      await ctx.reply('❌ Only group admins/owners can toggle lewd mode.');
+      return;
+    }
+
+    let enabled: boolean | null = null;
+    if (arg === 'yes' || arg === 'on' || arg === 'enable' || arg === 'true' || arg === '1') {
+      enabled = true;
+    } else if (arg === 'no' || arg === 'off' || arg === 'disable' || arg === 'false' || arg === '0') {
+      enabled = false;
+    } else {
+      // No arg or invalid arg -> show current state
+      const settings = await getChatSettings(ctx.chat.id);
+      await ctx.reply(`Lewd mode is currently ${settings.lewd_mode === 1 ? 'ON' : 'OFF'} in this chat.\nUsage: /lewdmode <yes|no|on|off|enable|disable|true|false>`);
+      return;
+    }
+
+    await upsertChatSettings(ctx.chat.id, { lewd_mode: enabled ? 1 : 0 });
+    await ctx.reply(`✅ Lewd mode is now ${enabled ? 'ON' : 'OFF'} in this chat.`);
+  });
+
+  // ---- Chat: lock/disable commands ----
+  bot.command('lock', async (ctx) => {
+    if (!(await canManageChat(ctx))) {
+      await ctx.reply('❌ Only group admins/owners can lock commands.');
+      return;
+    }
+    const cmd = (ctx.match?.trim() ?? '').toLowerCase();
+    if (!cmd) {
+      await ctx.reply('Usage: /lock <command>\nExample: /lock kiss');
+      return;
+    }
+    // Strip leading slash if present
+    const cleanCmd = cmd.startsWith('/') ? cmd.slice(1) : cmd;
+    const expression = await getExpressionByAlias(cleanCmd);
+    if (!expression) {
+      await ctx.reply(`❌ Unknown command /${cleanCmd}.`);
+      return;
+    }
+    const settings = await getChatSettings(ctx.chat.id);
+    if (!settings.disabled_commands.includes(expression.name)) {
+      settings.disabled_commands.push(expression.name);
+      await upsertChatSettings(ctx.chat.id, { disabled_commands: settings.disabled_commands });
+      await ctx.reply(`✅ Command /${expression.name} is now locked in this chat.`);
+    } else {
+      await ctx.reply(`⚠️ Command /${expression.name} is already locked in this chat.`);
+    }
+  });
+
+  // ---- Chat: unlock/enable commands ----
+  bot.command('unlock', async (ctx) => {
+    if (!(await canManageChat(ctx))) {
+      await ctx.reply('❌ Only group admins/owners can unlock commands.');
+      return;
+    }
+    const cmd = (ctx.match?.trim() ?? '').toLowerCase();
+    if (!cmd) {
+      await ctx.reply('Usage: /unlock <command>\nExample: /unlock kiss');
+      return;
+    }
+    // Strip leading slash if present
+    const cleanCmd = cmd.startsWith('/') ? cmd.slice(1) : cmd;
+    const expression = await getExpressionByAlias(cleanCmd);
+    if (!expression) {
+      await ctx.reply(`❌ Unknown command /${cleanCmd}.`);
+      return;
+    }
+    const settings = await getChatSettings(ctx.chat.id);
+    const index = settings.disabled_commands.indexOf(expression.name);
+    if (index !== -1) {
+      settings.disabled_commands.splice(index, 1);
+      await upsertChatSettings(ctx.chat.id, { disabled_commands: settings.disabled_commands });
+      await ctx.reply(`✅ Command /${expression.name} is now unlocked in this chat.`);
+    } else {
+      await ctx.reply(`⚠️ Command /${expression.name} is not locked in this chat.`);
+    }
+  });
+
+  // ---- Chat: list locked commands ----
+  bot.command('locks', async (ctx) => {
+    if (!(await canManageChat(ctx))) {
+      await ctx.reply('❌ Only group admins/owners can view locked commands.');
+      return;
+    }
+    const settings = await getChatSettings(ctx.chat.id);
+    if (settings.disabled_commands.length === 0) {
+      await ctx.reply('No locked commands in this chat.');
+      return;
+    }
+    await sendHtml(ctx, 'locks', buildLocksMessage(settings.disabled_commands));
+  });
+
+  // ---- Chat: toggle bluetext mode (delete command after sending) ----
+  bot.command('bluetextmode', async (ctx) => {
+    if (!(await canManageChat(ctx))) {
+      await ctx.reply('❌ Only group admins/owners can toggle bluetext mode.');
+      return;
+    }
+    const arg = (ctx.match?.trim() ?? '').toLowerCase();
+    let enabled: boolean | null = null;
+    if (arg === 'on' || arg === 'enable' || arg === 'true' || arg === '1') {
+      enabled = true;
+    } else if (arg === 'off' || arg === 'disable' || arg === 'false' || arg === '0') {
+      enabled = false;
+    } else {
+      // No arg or invalid arg -> show current state
+      const settings = await getChatSettings(ctx.chat.id);
+      await ctx.reply(`Bluetext mode is currently ${settings.bluetext === 1 ? 'ON' : 'OFF'} in this chat.\nUsage: /bluetextmode <on|off|enable|disable|true|false>`);
+      return;
+    }
+
+    await upsertChatSettings(ctx.chat.id, { bluetext: enabled ? 1 : 0 });
+    await ctx.reply(`✅ Bluetext mode is now ${enabled ? 'ON' : 'OFF'} in this chat.`);
+  });
+
+  // ---- Dynamic expression command handler (catch-all for command messages) ----
+  bot.on('message:text', async (ctx, next) => {
+    const text = ctx.message.text;
+    if (!text.startsWith('/')) return next();
+
+    // Accept an optional @BotName suffix on the command token while preserving
+    // an @username argument as a target.
+    const match = text.trim().match(/^\/([a-z0-9_]+)(?:@([a-z0-9_]+))?(?=\s|$)/i);
+    if (!match) return next();
+    const cmd = match[1].toLowerCase();
+    if (match[2] && match[2].toLowerCase() !== (ctx.me.username ?? '').toLowerCase()) return next();
+
+    // Look up if this command matches any known expression or alias
+    const expression = await getExpressionByAlias(cmd);
+    if (!expression) return next();
+
+    // ---- Resolve target user ----
+    let targetUser = ctx.message.reply_to_message?.from;
+    let targetMention: string | null = null;
+    let targetMessageId: number | undefined;
+
+    if (ctx.message.reply_to_message) {
+      targetMessageId = ctx.message.reply_to_message.message_id;
+      if (targetUser?.is_bot) {
+        await ctx.reply('You can only react to human users.');
+        return;
+      }
+    }
+
+    // A bot cannot resolve arbitrary user usernames to numeric IDs through
+    // getChat. Keep the explicit username as a plain caption mention instead.
+    const mentionMatch = text.trim().match(/^\/\S+\s+@([a-z0-9_]+)/i);
+    if (mentionMatch) {
+      targetMention = `@${mentionMatch[1]}`;
+    }
+
+    // Must have a resolved target
+    if ((!targetUser && !targetMention) || targetUser?.is_bot) {
+      await ctx.reply(
+        `Please reply to a user's message with /${expression.name}, or use /${expression.name} @username.`,
+      );
+      return;
+    }
+
+    // ---- Check per-chat settings ----
+    const chatId = ctx.chat?.id ?? 0;
+    const chatSettings = await getChatSettings(chatId);
+
+    // Lock check
+    if (await isExpressionDisabledInChat(chatId, expression.name)) {
+      await ctx.reply(`❌ Command /${expression.name} is currently disabled in this chat.`);
+      return;
+    }
+
+    // Lewd check
+    if (expression.is_lewd === 1 && chatSettings.lewd_mode !== 1) {
+      await ctx.reply(
+        `⚠️ This is a lewd command. Use /lewdmode on to enable lewd commands in this chat.`,
+      );
+      return;
+    }
+
+    // Pick a random media, respecting lewd filter
+    const allowLewd = chatSettings.lewd_mode === 1;
+    const media = await getRandomMediaForExpression(expression.id, allowLewd);
+    if (!media) {
+      await ctx.reply(`❌ No GIFs uploaded for /${expression.name} yet. Ask an admin to upload some first.`);
+      return;
+    }
+
+    // Send the GIF as animation (Telegram treats GIF as animation)
+    const caption = clampVisible(
+      formatCaption(
+        expression.caption_template,
+        ctx.message.from,
+        targetUser ?? { first_name: targetMention!, username: targetMention!.slice(1) },
+        expression.name,
+        expression.direction,
+      ),
+      TELEGRAM_CAPTION_LIMIT,
+    );
+    try {
+      await ctx.replyWithAnimation(media.file_id, {
+        caption,
+        parse_mode: 'HTML',
+        // Reply to the target message when replying; standalone for @username
+        ...(targetMessageId ? { reply_parameters: { message_id: targetMessageId } } : {}),
+      });
+      await incrementUsage(media.id);
+
+      // Bluetext: delete the invoking command message if enabled and in a group
+      const isGroup = ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup';
+      if (isGroup && chatSettings.bluetext === 0) {
+        // Needs "delete messages" rights, which the bot often does not have;
+        // logged rather than swallowed so the cause is visible.
+        ctx.deleteMessage().catch((err) =>
+          logApiError('bluetext:delete', err, { chat_id: ctx.chat?.id }),
+        );
+      }
+    } catch (err) {
+      logApiError('animation', err, {
+        expression: expression.name,
+        file_id: media.file_id,
+        template: expression.caption_template,
+      });
+      await ctx.reply('❌ Failed to send GIF.');
+    }
+  });
+
+  // ---- Media ingestion: handle channel posts (dump channel) ----
+  bot.on('channel_post', async (ctx) => {
+    const config = loadConfig();
+    const msg = ctx.channelPost;
+    if (!msg) return;
+
+    if (config.DUMP_CHANNEL_ID && msg.chat.id !== config.DUMP_CHANNEL_ID) {
+      return;
+    }
+
+    // Determine expression: either from CHANNEL_EXPRESSION_MAP or fallback to caption hashtags
+    const expressions = new Map<number, Expression>();
+    const mappedExpr = resolveChannelExpression(msg.chat.id, config.CHANNEL_EXPRESSION_MAP);
+    if (mappedExpr) {
+      const mapped = await getExpressionByName(mappedExpr);
+      if (mapped) expressions.set(mapped.id, mapped);
+    }
+
+    // Extract file from animation or video
+    const file = msg.animation ?? msg.video;
+    if (!file) return;
+
+    const { file_id, file_unique_id } = file;
+
+    // Determine expression via caption hashtags if not resolved from channel map
+    let isLewd = false;
+    if (msg.caption) {
+      const tags = (msg.caption.match(/#[a-z0-9_-]+/gi) ?? [])
+        .map((tag) => tag.slice(1).toLowerCase());
+      for (const tag of tags) {
+        if (tag === 'lewd') {
+          isLewd = true;
+          continue;
+        }
+        const expr = await getExpressionByAlias(tag);
+        if (expr) expressions.set(expr.id, expr);
+      }
+    }
+
+    // ---- Visual duplicate check (perceptual hash) ----
+    let phash: string | null = null;
+    let media = await getMediaByFileUniqueId(file_unique_id);
+    if (!media) {
+      // No file_unique_id hit → check if this GIF visually matches an existing one
+      try {
+        phash = await computeTelegramFilePhash(ctx, file_id);
+
+        if (phash) {
+          const dupe = await findVisualDuplicate(phash);
+          if (dupe) {
+            console.log(
+              `[dedupe] channel: file_unique_id=${file_unique_id} matches media #${dupe.media.id} (distance ${dupe.distance})`,
+            );
+            media = dupe.media;
+            // If this post carries #lewd, mark the existing record lewd
+            if (isLewd) {
+              await setMediaLewd(media.id);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[dedupe] channel: could not compute phash:', err);
+      }
+
+      // Insert (or keep the existing row from dupe check)
+      if (!media) {
+        media = await insertMedia(file_id, file_unique_id, isLewd ? 1 : 0, phash, msg.message_id);
+      }
+    }
+
+    if (media.channel_msg_id === null) {
+      await setMediaChannelMsgIdIfMissing(media.id, msg.message_id);
+    }
+    if (isLewd) await setMediaLewd(media.id);
+    for (const expression of expressions.values()) {
+      await linkMediaToExpression(media.id, expression.id);
+    }
+  });
+
+  // ---- Media ingestion: handle private admin uploads via /mode ----
+  bot.on(['message:animation', 'message:video'], async (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    if (!ctx.message) return;
+    if (!(await isBotAdmin(ctx.from?.id))) return;
+
+    const file = ctx.message.animation ?? ctx.message.video;
+    if (!file) return;
+
+    const { file_id, file_unique_id } = file;
+
+    if (ctx.session?.rescanActive) {
+      const origin = ctx.message.forward_origin;
+      const dumpChannelId = loadConfig().DUMP_CHANNEL_ID;
+      if (origin?.type !== 'channel' || (dumpChannelId !== undefined && origin.chat.id !== dumpChannelId)) {
+        await ctx.reply('Please forward a GIF/video post from the configured dump channel while /rescan is active.');
+        return;
+      }
+
+      const expressions = new Map<number, Expression>();
+      const mappedName = resolveChannelExpression(origin.chat.id, loadConfig().CHANNEL_EXPRESSION_MAP);
+      if (mappedName) {
+        const mapped = await getExpressionByName(mappedName);
+        if (mapped) expressions.set(mapped.id, mapped);
+      }
+      const tags = (ctx.message.caption?.match(/#[a-z0-9_-]+/gi) ?? []).map((tag) => tag.slice(1).toLowerCase());
+      const isLewd = tags.includes('lewd');
+      for (const tag of tags) {
+        if (tag === 'lewd') continue;
+        const expression = await getExpressionByAlias(tag);
+        if (expression) expressions.set(expression.id, expression);
+      }
+
+      let media = await getMediaByFileUniqueId(file_unique_id);
+      let phash: string | null = null;
+      if (!media) {
+        try {
+          phash = await computeTelegramFilePhash(ctx, file_id);
+          if (phash) {
+            const duplicate = await findVisualDuplicate(phash);
+            if (duplicate) media = duplicate.media;
+          }
+        } catch (err) {
+          console.warn('[rescan] could not compute phash:', err);
+        }
+      }
+      if (!media) {
+        media = await insertMedia(file_id, file_unique_id, isLewd ? 1 : 0, phash, origin.message_id);
+      } else if (ctx.session.rescanMode === 'relink') {
+        await setMediaChannelMsgId(media.id, origin.message_id);
+      } else if (media.channel_msg_id === null) {
+        await setMediaChannelMsgIdIfMissing(media.id, origin.message_id);
+      }
+      const duplicateOf = ctx.session.rescanMode !== 'relink' && media.channel_msg_id !== null && media.channel_msg_id !== origin.message_id
+        ? media.channel_msg_id
+        : null;
+      if (isLewd) await setMediaLewd(media.id);
+      for (const expression of expressions.values()) await linkMediaToExpression(media.id, expression.id);
+
+      ctx.session.rescannedCount = (ctx.session.rescannedCount ?? 0) + 1;
+      if (duplicateOf !== null) {
+        ctx.session.uploadedItems = ctx.session.uploadedItems ?? [];
+        ctx.session.uploadedItems.push({
+          channelMsgId: origin.message_id,
+          mediaId: media.id,
+          deleteMediaOnRemove: false,
+          duplicateOfChannelMsgId: duplicateOf,
+        });
+      }
+      const tagSummary = expressions.size ? ` Tagged: ${[...expressions.values()].map((e) => `/${e.name}`).join(', ')}.` : ' No expression hashtag was found.';
+      await ctx.reply(
+        duplicateOf !== null
+          ? `⚠️ Duplicate channel post #${origin.message_id} matches #${duplicateOf}. It is queued for optional removal with /remove.${tagSummary}`
+          : `✅ Reindexed channel post #${origin.message_id}.${tagSummary}`,
+      );
+      return;
+    }
+
+    const activeNames = ctx.session?.activeExpressions ?? (ctx.session?.activeExpression ? [ctx.session.activeExpression] : []);
+    if (activeNames.length === 0) return;
+
+    const expressions: Expression[] = [];
+    for (const name of activeNames) {
+      const expression = await getExpressionByName(name);
+      if (expression) expressions.push(expression);
+    }
+    if (expressions.length !== activeNames.length) {
+      await ctx.reply(`❌ One or more active expressions no longer exist. Reset with /mode expression [expression ...].`);
+      return;
+    }
+
+    // Check for #lewd tag in caption or message text
+    const msgText = ctx.message.caption ?? ctx.message.text ?? '';
+    const isLewd = /(?:^|\s)#lewd\b/i.test(msgText);
+    // #lewd classifies this media only. Expression visibility is controlled
+    // separately by the explicit /togglelewd command.
+
+    let media = await getMediaByFileUniqueId(file_unique_id);
+    let createdMediaRecord = false;
+    let phash: string | null = null;
+    if (!media) {
+      // No file_unique_id hit → check whether this GIF visually matches an existing one
+      try {
+        phash = await computeTelegramFilePhash(ctx, file_id);
+
+        if (phash) {
+          const dupe = await findVisualDuplicate(phash);
+          if (dupe) {
+            console.log(
+              `[dedupe] private upload: file_unique_id=${file_unique_id} matches media #${dupe.media.id} (distance ${dupe.distance})`,
+            );
+            media = dupe.media;
+            if (isLewd) {
+              await setMediaLewd(media.id);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('[dedupe] private upload: could not compute phash:', err);
+      }
+    }
+
+    // ---- Copy to dump channel if configured (sets caption on send) ----
+    let channelMsgId: number | null = null;
+    if (config.DUMP_CHANNEL_ID) {
+      const channelId = config.DUMP_CHANNEL_ID;
+      const captionText = `${expressions.map((expression) => `#${expression.name}`).join(' ')}${isLewd ? ' #lewd' : ''}`;
+      const channelMsg = await ctx.api.copyMessage(
+        channelId,
+        ctx.chat.id,
+        ctx.message.message_id,
+        { caption: captionText, parse_mode: 'HTML' },
+      ).catch((err) => {
+        console.warn('[upload] failed to copy to channel:', err.message);
+        return null;
+      });
+
+      if (channelMsg) {
+        channelMsgId = channelMsg.message_id;
+      }
+    }
+
+    if (config.DUMP_CHANNEL_ID && channelMsgId === null) {
+      await ctx.reply('❌ The GIF could not be copied to the dump channel, so it was not added to the library.');
+      return;
+    }
+
+    // ---- Save to DB (after copy so we have the channel_msg_id) ----
+    if (!media) {
+      // New media — insert with channel_msg_id
+      media = await insertMedia(file_id, file_unique_id, isLewd ? 1 : 0, phash, channelMsgId);
+      createdMediaRecord = true;
+    } else if (channelMsgId !== null) {
+      // Keep the original channel reference when this is a visual duplicate.
+      await setMediaChannelMsgIdIfMissing(media.id, channelMsgId);
+    }
+
+    if (isLewd) await setMediaLewd(media.id);
+    const expressionIdsAdded: number[] = [];
+    for (const expression of expressions) {
+      if (await linkMediaToExpression(media.id, expression.id)) expressionIdsAdded.push(expression.id);
+    }
+
+    if (channelMsgId !== null) {
+      ctx.session!.uploadedItems = ctx.session!.uploadedItems ?? [];
+      ctx.session!.uploadedItems.push({
+        channelMsgId,
+        mediaId: media.id,
+        deleteMediaOnRemove: createdMediaRecord,
+        expressionIds: expressions.map((expression) => expression.id),
+        expressionIdsAdded,
+      });
+    }
+    ctx.session!.uploadedCount = (ctx.session!.uploadedCount ?? 0) + 1;
+
+    // Rate-limit: small delay between uploads to avoid Telegram throttling
+    await sleep(400);
+  });
+
+  // ---- Command: /sauce (reverse image search) ----
+  bot.command('sauce', async (ctx) => {
+    if (!ctx.message?.reply_to_message) {
+      await ctx.reply('Please reply to a GIF, video, or image with /sauce.');
+      return;
+    }
+    const replyMsg = ctx.message.reply_to_message;
+
+    let file: {
+      file_id: string;
+      file_unique_id: string;
+    } | null = null;
+
+    if (replyMsg.sticker?.is_animated && !replyMsg.sticker.is_video) {
+      await ctx.reply('Animated TGS stickers are not supported yet. Try a static or video sticker.');
+      return;
+    } else if (replyMsg.sticker) {
+      file = {
+        file_id: replyMsg.sticker.file_id,
+        file_unique_id: replyMsg.sticker.file_unique_id,
+      };
+    } else if (replyMsg.animation) {
+      file = {
+        file_id: replyMsg.animation.file_id,
+        file_unique_id: replyMsg.animation.file_unique_id,
+      };
+    } else if (replyMsg.video) {
+      file = {
+        file_id: replyMsg.video.file_id,
+        file_unique_id: replyMsg.video.file_unique_id,
+      };
+    } else if (replyMsg.photo) {
+      const photo = replyMsg.photo.reduce((prev, curr) =>
+        (prev.file_size ?? 0) > (curr.file_size ?? 0) ? prev : curr,
+      );
+      file = {
+        file_id: photo.file_id,
+        file_unique_id: photo.file_unique_id,
+      };
+    } else {
+      await ctx.reply('Reply message must contain an image, GIF, video, or static/video sticker.');
+      return;
+    }
+
+    if (!file) {
+      await ctx.reply('Could not extract media from replied message.');
+      return;
+    }
+
+    // The cache is checked inside reverseSearch, which returns `cached` so the
+    // caption can say so. This handler used to parse the cache row a second
+    // time and render its own caption from it; the two renderings drifted.
+    const config = loadConfig();
+    // Anchor both the temporary status and the final result to the media the
+    // user selected, rather than to the /sauce command message.
+    const processing = await ctx.api.sendMessage(ctx.chat.id, '🔍 Searching reverse image databases…', {
+      reply_parameters: { message_id: replyMsg.message_id },
+    });
+
+    const tmpDir = await mkdtemp(join(tmpdir(), 'tg-bot-'));
+    const tmpFile = join(tmpDir, 'input.bin');
+
+    try {
+      // Download the file from Telegram
+      const fileInfo = await ctx.api.getFile(file.file_id);
+      if (!fileInfo.file_path) {
+        throw new Error('Could not retrieve file path from Telegram');
+      }
+
+      // Contains the bot token: never log it and never put it in a message.
+      const downloadUrl = `https://api.telegram.org/file/bot${config.BOT_TOKEN}/${fileInfo.file_path}`;
+      const fileRes = await fetch(downloadUrl, { signal: AbortSignal.timeout(20_000) });
+      if (!fileRes.ok) {
+        throw new Error(`Failed to download file from Telegram: ${fileRes.status} ${fileRes.statusText}`);
+      }
+
+      const buffer = Buffer.from(await fileRes.arrayBuffer());
+      await writeFile(tmpFile, buffer);
+
+      // Perform combined search
+      const result = await reverseSearch(file.file_unique_id, tmpFile);
+      console.log(
+        `[sauce] ${file.file_unique_id}: traceMoe=${result.traceMoe ? 'hit' : 'miss'} sauceNao=${result.sauceNao ? 'hit' : 'miss'} iqdb=${result.iqdb ? 'hit' : 'miss'} cached=${result.cached}`,
+      );
+
+      // Backfill phash for existing media that lacks one — frames are already on disk.
+      const existing = await getMediaByFileUniqueId(file.file_unique_id);
+      if (existing && !existing.phash) {
+        const phash = await computePhash(tmpFile);
+        if (phash) {
+          await setMediaPhash(existing.id, phash);
+          console.log(`[sauce] backfilled phash for media #${existing.id}`);
+        }
+      }
+
+      const built = buildSauceCaption({
+        traceMoe: result.traceMoe,
+        sauceNao: result.sauceNao,
+        iqdb: result.iqdb,
+        googleLensUrl: result.googleLensUrl,
+        yandexUrl: result.yandexUrl,
+        cached: result.cached,
+      });
+      const replyMarkup = buildSauceKeyboard({
+        traceMoe: result.traceMoe,
+        sauceNao: result.sauceNao,
+        iqdb: result.iqdb,
+        googleLensUrl: result.googleLensUrl,
+        yandexUrl: result.yandexUrl,
+      });
+      if (built.dropped > 0) {
+        console.warn(`[sauce] caption hit the length cap; ${built.dropped} line(s) dropped`);
+      }
+
+      const clipUrl = result.traceMoe?.videoUrl;
+      if (clipUrl?.startsWith('https://api.trace.moe/')) {
+        try {
+          await ctx.api.sendVideo(processing.chat.id, clipUrl, {
+            caption: built.text,
+            parse_mode: 'HTML',
+            supports_streaming: true,
+            reply_parameters: { message_id: replyMsg.message_id },
+            ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+          });
+          await ctx.api.deleteMessage(processing.chat.id, processing.message_id).catch(() => {});
+          return;
+        } catch (err) {
+          console.warn('[sauce] Could not send trace.moe clip as video; showing result card instead:', err);
+        }
+      }
+
+      await ctx.api.editMessageText(processing.chat.id, processing.message_id, built.text, {
+        parse_mode: 'HTML',
+        link_preview_options: { is_disabled: true },
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      });
+    } catch (err) {
+      logApiError('sauce', err, {
+        file_unique_id: file.file_unique_id,
+        chat_id: ctx.chat?.id,
+      });
+      await ctx.api
+        .editMessageText(
+          processing.chat.id,
+          processing.message_id,
+          '❌ Search failed. Please try again later.',
+        )
+        .catch((editErr) => logApiError('sauce:edit', editErr));
+    } finally {
+      try {
+        await rm(tmpDir, { recursive: true, force: true });
+      } catch (err) {
+        console.warn('[sauce] Could not remove temp dir:', err);
+      }
+    }
+  });
+
+  // ---- Inline mode: refused — lewd commands must stay out of inline mode ----
+  bot.on('inline_query', async (ctx) => {
+    await ctx.answerInlineQuery(
+      [],
+      { cache_time: 300, button: { text: 'Use /help in private', start_parameter: 'inline_off' } },
+    );
+  });
+
+  return bot;
+}

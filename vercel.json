@@ -1,0 +1,19 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "version": 2,
+  "routes": [
+    {
+      "src": "/webhook",
+      "dest": "api/webhook.ts"
+    }
+  ],
+  "functions": {
+    "api/webhook.ts": {
+      "maxDuration": 300
+    }
+  },
+  "regions": ["sin1"],
+  "env": {
+    "NODE_ENV": "production"
+  }
+}
