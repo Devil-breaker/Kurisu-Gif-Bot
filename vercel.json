@@ -3,6 +3,7 @@
   "version": 2,
   "framework": null,
   "buildCommand": "",
+  "fluid": true,
   "routes": [
     {
       "src": "/webhook",
@@ -14,7 +15,7 @@
       "maxDuration": 300
     }
   },
-  "regions": ["sin1"],
+  "regions": ["bom1"],
   "env": {
     "NODE_ENV": "production"
   }
