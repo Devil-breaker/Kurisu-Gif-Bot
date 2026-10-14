@@ -116,6 +116,8 @@ interface BotContext extends Context {
     rescanMode?: 'index' | 'relink';
     rescannedCount?: number;
     uploadedCount?: number;
+    skippedDuplicateCount?: number;
+    duplicateTagCount?: number;
     uploadedItems?: UploadSessionItem[];
   };
 }
@@ -1004,12 +1006,16 @@ export function createBot() {
     const rescannedCount = ctx.session?.rescannedCount ?? 0;
     const duplicateCount = wasRescan ? (ctx.session?.uploadedItems?.length ?? 0) : 0;
     const count = ctx.session?.uploadedCount ?? 0;
+    const skippedDuplicateCount = ctx.session?.skippedDuplicateCount ?? 0;
+    const duplicateTagCount = ctx.session?.duplicateTagCount ?? 0;
     const expressions = ctx.session?.activeExpressions ?? (ctx.session?.activeExpression ? [ctx.session.activeExpression] : []);
     // Clear the active expression from session and delete the session entry
     if (ctx.session) {
       ctx.session.activeExpression = undefined;
       ctx.session.activeExpressions = undefined;
       ctx.session.uploadedCount = undefined;
+      ctx.session.skippedDuplicateCount = undefined;
+      ctx.session.duplicateTagCount = undefined;
       if (wasRescan) {
         ctx.session.rescanActive = undefined;
         ctx.session.rescanMode = undefined;
@@ -1031,13 +1037,21 @@ export function createBot() {
       return;
     }
     if (count === 0) {
-      await ctx.reply('✅ Upload session ended. No GIFs were uploaded this session.');
+      await ctx.reply(
+        skippedDuplicateCount > 0
+          ? `✅ Upload session ended. No new GIFs were copied. Skipped ${skippedDuplicateCount} duplicate upload${skippedDuplicateCount === 1 ? '' : 's'}.` +
+            (duplicateTagCount > 0 ? ` Added ${duplicateTagCount} new expression tag${duplicateTagCount === 1 ? '' : 's'} to existing GIF${duplicateTagCount === 1 ? '' : 's'}.` : '')
+          : '✅ Upload session ended. No GIFs were uploaded this session.',
+      );
       return;
     }
     const tagText = expressions.length ? ` with ${expressions.map((name) => `/${name}`).join(', ')}` : '';
     await ctx.reply(
       `✅ <b>Upload complete!</b>\n\n` +
       `📤 <b>${count}</b> GIF${count === 1 ? '' : 's'} forwarded to channel${tagText}.\n\n` +
+      (skippedDuplicateCount > 0
+        ? `⏭️ Skipped ${skippedDuplicateCount} duplicate upload${skippedDuplicateCount === 1 ? '' : 's'}; ${duplicateTagCount} new expression tag${duplicateTagCount === 1 ? '' : 's'} added to existing GIFs.\n\n`
+        : '') +
       `Ready for another batch — send /mode &lt;expression&gt; [expression ...] to start.`,
       { parse_mode: 'HTML' },
     );
@@ -1675,6 +1689,7 @@ export function createBot() {
 
     let media = await getMediaByFileUniqueId(file_unique_id);
     let createdMediaRecord = false;
+    let isDuplicate = media !== null;
     let phash: string | null = null;
     if (!media) {
       // No file_unique_id hit → check whether this GIF visually matches an existing one
@@ -1688,6 +1703,7 @@ export function createBot() {
               `[dedupe] private upload: file_unique_id=${file_unique_id} matches media #${dupe.media.id} (distance ${dupe.distance})`,
             );
             media = dupe.media;
+            isDuplicate = true;
             if (isLewd) {
               await setMediaLewd(media.id);
             }
@@ -1696,6 +1712,22 @@ export function createBot() {
       } catch (err) {
         console.warn('[dedupe] private upload: could not compute phash:', err);
       }
+    }
+
+    if (media && isDuplicate) {
+      if (isLewd) await setMediaLewd(media.id);
+      let addedTagCount = 0;
+      for (const expression of expressions) {
+        if (await linkMediaToExpression(media.id, expression.id)) addedTagCount += 1;
+      }
+      ctx.session!.skippedDuplicateCount = (ctx.session!.skippedDuplicateCount ?? 0) + 1;
+      ctx.session!.duplicateTagCount = (ctx.session!.duplicateTagCount ?? 0) + addedTagCount;
+      console.log(
+        `[upload] skipped duplicate media #${media.id}; added ${addedTagCount} expression tag(s)`,
+      );
+      // Existing media can gain missing expression tags, but a duplicate copy
+      // must not be added to the dump channel again.
+      return;
     }
 
     // ---- Copy to dump channel if configured (sets caption on send) ----
