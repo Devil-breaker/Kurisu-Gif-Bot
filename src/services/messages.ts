@@ -277,9 +277,9 @@ export function buildExpressionListMessage(expressions: Expression[]): BuiltMess
     return `  • <code>/${escapeHtml(e.name)}</code>${aliases ? ` (aliases: ${aliases})` : ''}`;
   };
 
-  const lines: string[] = ['<b>Commands:</b>', ...commandGrid(safe.map(fmt))];
+  const lines: string[] = ['🎭 <b>Expressions &amp; Aliases</b>', '', '<b>Safe Expressions</b>', ...commandGrid(safe.map(fmt))];
   if (lewd.length > 0) {
-    lines.push('', '<b>Lewd Commands:</b> (require <code>/lewdmode on</code>)', ...commandGrid(lewd.map(fmt)));
+    lines.push('', '<b>🔞 Lewd Expressions</b> (require <code>/lewdmode on</code>)', ...commandGrid(lewd.map(fmt)));
   }
   lines.push('', 'Reply to a user, or use <code>/&lt;cmd&gt; @username</code>, to send a GIF.');
 

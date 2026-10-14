@@ -297,6 +297,20 @@ export async function getMediaStats(): Promise<{ expression: string; count: numb
   }));
 }
 
+export async function getAvailableExpressionNames(allowLewd = false): Promise<string[]> {
+  const db = getDb();
+  const result = await db.execute({
+    sql: `SELECT DISTINCT e.name
+          FROM expressions e
+          JOIN media_expressions me ON me.expression_id = e.id
+          JOIN media m ON m.id = me.media_id
+          WHERE (? = 1 OR (e.is_lewd = 0 AND m.is_lewd = 0))
+          ORDER BY e.name`,
+    args: [allowLewd ? 1 : 0],
+  });
+  return result.rows.map((row) => row.name as string);
+}
+
 export async function deleteMediaByFileUniqueId(fileUniqueId: string): Promise<boolean> {
   const db = getDb();
   const result = await db.execute({

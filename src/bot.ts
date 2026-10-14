@@ -57,6 +57,7 @@ import {
   getRandomMediaForExpression,
   incrementUsage,
   getMediaStats,
+  getAvailableExpressionNames,
   deleteMediaById,
   unlinkMediaFromExpression,
   isAdmin,
@@ -374,13 +375,13 @@ async function canManageChat(ctx: Context): Promise<boolean> {
  * silently dropping the tail of /help as expressions are added is exactly the
  * kind of thing nobody notices until someone asks why a command is missing.
  */
-async function sendHtml(ctx: Context, label: string, built: BuiltMessage): Promise<void> {
+async function sendHtml(ctx: Context, label: string, built: BuiltMessage, quoted = false): Promise<void> {
   if (built.dropped > 0) {
     console.warn(
       `[${label}] Message hit Telegram's length cap; ${built.dropped} line(s) dropped`,
     );
   }
-  await ctx.reply(built.text, { parse_mode: 'HTML' });
+  await ctx.reply(quoted ? quoteMenuText(built.text) : built.text, { parse_mode: 'HTML' });
 }
 
 /** Create bot instance and configure middleware */
@@ -546,7 +547,7 @@ export function createBot() {
       await ctx.reply('No expressions configured.');
       return;
     }
-    await sendHtml(ctx, 'listexpressions', buildExpressionListMessage(expressions));
+    await sendHtml(ctx, 'listexpressions', buildExpressionListMessage(expressions), true);
   });
 
   // ---- Command: /stats ----
@@ -1468,7 +1469,11 @@ export function createBot() {
     const allowLewd = chatSettings.lewd_mode === 1;
     const media = await getRandomMediaForExpression(expression.id, allowLewd);
     if (!media) {
-      await ctx.reply(`❌ No GIFs uploaded for /${expression.name} yet. Ask an admin to upload some first.`);
+      const available = (await getAvailableExpressionNames(allowLewd)).map((name) => `/${name}`);
+      const message = available.length
+        ? `No GIFs are available for /${expression.name} yet. Try: ${available.join(' ')}`
+        : 'No GIF commands have GIFs available yet.';
+      await ctx.reply(message);
       return;
     }
 
