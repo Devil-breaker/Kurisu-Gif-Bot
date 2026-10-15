@@ -118,6 +118,30 @@ export async function unmarkMediaLewdInChat(chatId: number, mediaId: number): Pr
   return result.rowsAffected > 0;
 }
 
+/** Number of media entries marked lewd in one chat. */
+export async function countChatLewdMedia(chatId: number): Promise<number> {
+  const db = getDb();
+  const result = await db.execute({
+    sql: 'SELECT COUNT(*) AS count FROM chat_lewd_media WHERE chat_id = ?',
+    args: [chatId],
+  });
+  return Number(result.rows[0]?.count ?? 0);
+}
+
+/** Fetch one stable page of chat-only lewd media for the admin browser. */
+export async function getChatLewdMediaPage(chatId: number, offset: number, limit = 1): Promise<Media[]> {
+  const db = getDb();
+  const result = await db.execute({
+    sql: `SELECT m.* FROM media m
+          JOIN chat_lewd_media clm ON clm.media_id = m.id
+          WHERE clm.chat_id = ?
+          ORDER BY clm.created_at, clm.media_id
+          LIMIT ? OFFSET ?`,
+    args: [chatId, limit, offset],
+  });
+  return result.rows as unknown as Media[];
+}
+
 /**
  * Upsert a media record, keyed on file_unique_id.
  * If phash is provided, stores it; ON CONFLICT uses COALESCE so an existing

@@ -52,6 +52,8 @@ import {
   getMediaByFileUniqueId,
   markMediaLewdInChat,
   unmarkMediaLewdInChat,
+  countChatLewdMedia,
+  getChatLewdMediaPage,
   insertMedia,
   setMediaChannelMsgId,
   setMediaChannelMsgIdIfMissing,
@@ -263,6 +265,7 @@ export function buildBotCommands(): Array<{ command: string; description: string
     { command: 'ping', description: 'Check bot uptime and latency' },
     { command: 'sauce', description: 'Reverse search a replied image, GIF, video, or sticker' },
     { command: 'lewdmode', description: 'Toggle Lewd Mode (NSFW) in this chat' },
+    { command: 'lewdgifs', description: 'Review GIFs hidden in this group' },
   ];
 }
 
@@ -434,6 +437,58 @@ export function createBot() {
   bot.on('callback_query', async (ctx) => {
     const data = ctx.callbackQuery?.data;
     if (!data) return;
+
+    const groupLewdMatch = data.match(/^group_lewd:(prev|next|safe):(\d+)(?::(\d+))?$/);
+    if (groupLewdMatch) {
+      const chatId = ctx.chat?.id;
+      const messageId = ctx.callbackQuery.message?.message_id;
+      const chatType = ctx.chat?.type;
+      if (!chatId || !messageId || (chatType !== 'group' && chatType !== 'supergroup')) {
+        await ctx.answerCallbackQuery({ text: 'This control only works in its group.', show_alert: true });
+        return;
+      }
+      if (!(await canManageChat(ctx))) {
+        await ctx.answerCallbackQuery({ text: 'Only group admins can manage these GIFs.', show_alert: true });
+        return;
+      }
+
+      const action = groupLewdMatch[1];
+      const page = Number(groupLewdMatch[2]);
+      const mediaId = groupLewdMatch[3] ? Number(groupLewdMatch[3]) : undefined;
+      if (action === 'safe' && mediaId !== undefined) {
+        await unmarkMediaLewdInChat(chatId, mediaId);
+        await ctx.answerCallbackQuery({ text: 'Marked safe in this group.' });
+      } else {
+        await ctx.answerCallbackQuery();
+      }
+
+      const count = await countChatLewdMedia(chatId);
+      if (count === 0) {
+        await ctx.api.editMessageCaption(chatId, messageId, {
+          caption: '✅ No GIFs are currently hidden in this group.',
+          reply_markup: { inline_keyboard: [] },
+        }).catch((err) => logApiError('group-lewd-browser:empty', err));
+        return;
+      }
+
+      const requestedPage = action === 'next' ? page + 1 : action === 'prev' ? page - 1 : page;
+      const currentPage = Math.max(0, Math.min(requestedPage, count - 1));
+      const [media] = await getChatLewdMediaPage(chatId, currentPage, 1);
+      if (!media) return;
+      const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+      const navigation: Array<{ text: string; callback_data: string }> = [];
+      if (currentPage > 0) navigation.push({ text: '◀️ Previous', callback_data: `group_lewd:prev:${currentPage}` });
+      if (currentPage < count - 1) navigation.push({ text: 'Next ▶️', callback_data: `group_lewd:next:${currentPage}` });
+      if (navigation.length) rows.push(navigation);
+      rows.push([{ text: '✅ Mark safe in this group', callback_data: `group_lewd:safe:${currentPage}:${media.id}` }]);
+      await ctx.api.editMessageMedia(chatId, messageId, {
+        type: 'animation',
+        media: media.file_id,
+        caption: `🔞 <b>Hidden in this group</b> · ${currentPage + 1} of ${count}\nLewd Mode off filters this GIF from reactions.`,
+        parse_mode: 'HTML',
+      }, { reply_markup: { inline_keyboard: rows } }).catch((err) => logApiError('group-lewd-browser:edit', err));
+      return;
+    }
 
     const isAdminUser = await isBotAdmin(ctx.from?.id);
     const isOwnerUser = await isBotOwner(ctx.from?.id);
@@ -1317,6 +1372,40 @@ export function createBot() {
 
     await upsertChatSettings(ctx.chat.id, { lewd_mode: enabled ? 1 : 0 });
     await ctx.reply(`✅ Lewd mode is now ${enabled ? 'ON' : 'OFF'} in this chat.`);
+  });
+
+  // ---- Group admins: browse and unmark GIFs hidden only in this chat ----
+  bot.command('lewdgifs', async (ctx) => {
+    const chatType = ctx.chat.type;
+    if (chatType !== 'group' && chatType !== 'supergroup') {
+      await ctx.reply('Use /lewdgifs inside the group where the GIFs were marked.');
+      return;
+    }
+    if (!(await canManageChat(ctx))) {
+      await ctx.reply('❌ Only group admins can review hidden GIFs.');
+      return;
+    }
+
+    const chatId = ctx.chat.id;
+    const count = await countChatLewdMedia(chatId);
+    if (count === 0) {
+      await ctx.reply('✅ No GIFs are currently hidden in this group.');
+      return;
+    }
+
+    const [media] = await getChatLewdMediaPage(chatId, 0, 1);
+    if (!media) {
+      await ctx.reply('✅ No GIFs are currently hidden in this group.');
+      return;
+    }
+    const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+    if (count > 1) rows.push([{ text: 'Next ▶️', callback_data: 'group_lewd:next:0' }]);
+    rows.push([{ text: '✅ Mark safe in this group', callback_data: `group_lewd:safe:0:${media.id}` }]);
+    await ctx.replyWithAnimation(media.file_id, {
+      caption: `🔞 <b>Hidden in this group</b> · 1 of ${count}\nLewd Mode off filters this GIF from reactions.`,
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: rows },
+    });
   });
 
   // ---- Chat: lock/disable commands ----
