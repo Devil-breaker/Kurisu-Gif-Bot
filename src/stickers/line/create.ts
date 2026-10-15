@@ -1,9 +1,9 @@
 import { spawn } from 'node:child_process';
 import { inflateRawSync } from 'node:zlib';
 import { InputFile } from 'grammy';
-import { getFfmpegPath } from './ffmpeg.js';
-import type { ParsedLinePack } from './line-stickers.js';
-import { logSafeError } from './safe-log.js';
+import { getFfmpegPath } from '../../services/ffmpeg.js';
+import type { ParsedLinePack } from './download.js';
+import { logSafeError } from '../../services/safe-log.js';
 
 const MAX_ZIP_ENTRIES = 2048;
 const MAX_EXPANDED_ZIP_BYTES = 32 * 1024 * 1024;

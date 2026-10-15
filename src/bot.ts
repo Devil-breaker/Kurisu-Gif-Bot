@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Context } from 'grammy';
-import { Bot, InputFile, session } from 'grammy';
+import { Bot, session } from 'grammy';
 
 
 /** Sessions live in the configured database so polling and webhook instances share state. */
@@ -80,8 +80,7 @@ import {
 import { getDb } from './db/client.js';
 import { loadConfig } from './config.js';
 import { reverseSearch } from './services/sauce.js';
-import { downloadLinePackZip, parseLinePackUrl } from './services/line-stickers.js';
-import { createLineTelegramPack } from './services/line-sticker-create.js';
+import { registerStickerFeatures } from './stickers/register.js';
 import { computePhash, hammingDistance } from './services/phash.js';
 import { logSafeError, safeErrorSummary } from './services/safe-log.js';
 import { TELEGRAM_CAPTION_LIMIT, clampVisible, formatCaption } from './services/caption.js';
@@ -237,6 +236,7 @@ export function buildBotCommands(): Array<{ command: string; description: string
     { command: 'rescan', description: 'Admin: re-index old channel posts by forwarding them here' },
     { command: 'remove', description: 'Admin: remove a mistakenly uploaded GIF from the dump channel' },
     { command: 'done', description: 'Admin: signal you are done uploading GIFs' },
+    { command: 'supported', description: 'Admin: list sticker conversion formats' },
     { command: 'stats', description: 'Show usage stats per expression' },
     { command: 'ping', description: 'Check bot uptime and latency' },
     { command: 'sauce', description: 'Reverse search a replied image, GIF, video, or sticker' },
@@ -821,150 +821,6 @@ export function createBot() {
       return;
     }
     await sendHtml(ctx, 'admins', buildAdminsMessage(admins, envAdminIds));
-  });
-
-  // ---- Admin: download LINE sticker/emoji packs as ZIP files ----
-  bot.command('linepack', async (ctx) => {
-    if (!(await isBotAdmin(ctx.from?.id))) {
-      await ctx.reply('❌ Only bot admins can use /linepack.');
-      return;
-    }
-    if (ctx.chat?.type !== 'private') {
-      await ctx.reply('Use /linepack in a private chat with the bot so the ZIP is sent privately.');
-      return;
-    }
-
-    const [rawUrl, rawFormat] = (ctx.match?.trim() ?? '').split(/\s+/);
-    const pack = rawUrl ? parseLinePackUrl(rawUrl) : null;
-    if (!pack) {
-      await ctx.reply(
-        'Usage: /linepack <LINE pack URL> [static|animated]\n\n' +
-        'Supports LINE sticker and emoji pack links. Sticker packs default to static; add “animated” for an animated pack when available. Emoji packs are static.',
-      );
-      return;
-    }
-
-    const format = (rawFormat?.toLowerCase() || 'static') as 'static' | 'animated';
-    if (format !== 'static' && format !== 'animated') {
-      await ctx.reply('Choose either “static” or “animated”.');
-      return;
-    }
-    if (pack.kind === 'emoji' && format === 'animated') {
-      await ctx.reply('Emoji pack ZIPs are currently available as static packs only.');
-      return;
-    }
-
-    const status = await ctx.reply('⏳ Fetching the LINE pack ZIP…');
-    try {
-      const result = await downloadLinePackZip(pack, format);
-      await ctx.api.sendDocument(
-        ctx.chat.id,
-        new InputFile(result.buffer, result.filename),
-        { reply_parameters: { message_id: ctx.msg.message_id } },
-      );
-      await ctx.api.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
-    } catch (err) {
-      logSafeError('linepack', err);
-      const message = 'Could not download this LINE pack. Please check the URL and try again.';
-      await ctx.api.editMessageText(ctx.chat.id, status.message_id, `❌ ${message}`).catch(async () => {
-        await ctx.reply(`❌ ${message}`);
-      });
-    }
-  });
-
-  // ---- Admin: create a Telegram sticker/custom emoji pack from a LINE pack ----
-  bot.command('linepackcreate', async (ctx) => {
-    if (!(await isBotAdmin(ctx.from?.id))) {
-      await ctx.reply('❌ Only bot admins can use /linepackcreate.');
-      return;
-    }
-    if (ctx.chat?.type !== 'private') {
-      await ctx.reply('Use /linepackcreate in a private chat with the bot.');
-      return;
-    }
-
-    const commandText = ctx.match?.trim() ?? '';
-    const separatorIndex = commandText.indexOf('|');
-    const hasTitle = separatorIndex !== -1;
-    const rawPackArguments = (hasTitle ? commandText.slice(0, separatorIndex) : commandText).trim().split(/\s+/).filter(Boolean);
-    const recreateExisting = rawPackArguments.includes('--recreate');
-    const packArguments = rawPackArguments.filter((argument) => argument !== '--recreate');
-    const customTitle = hasTitle ? commandText.slice(separatorIndex + 1).trim() : undefined;
-    const [rawUrl, requestedEmoji] = packArguments;
-    const pack = rawUrl ? parseLinePackUrl(rawUrl) : null;
-    if (!pack || packArguments.length > 2 || (hasTitle && !customTitle)) {
-      await ctx.reply(
-        'Usage: /linepackcreate <LINE pack URL> [emoji] [--recreate] | [custom pack name]\n\n' +
-          'Example: /linepackcreate https://store.line.me/stickershop/product/27642/en 🎉 | Spy Family Reactions\n\n' +
-          'Add --recreate before | only if Telegram says the existing pack cannot be found; it deletes and rebuilds the bot-created pack. ' +
-          'Creates static Telegram pack(s) from a LINE sticker or emoji pack. Large packs are split to Telegram’s pack-size limit and filled automatically in batches. ' +
-        'Animated LINE packs can still be downloaded with /linepack <URL> animated.\n' +
-        'Use /linepack <URL> to download the original ZIP instead.',
-      );
-      return;
-    }
-
-    if (customTitle && ([...customTitle].length > 64 || /[\u0000-\u001f\u007f]/.test(customTitle))) {
-      await ctx.reply('❌ The custom pack name must be 1–64 characters and cannot contain control characters.');
-      return;
-    }
-
-    const emoji = requestedEmoji || (pack.kind === 'emoji' ? '🙂' : '🎉');
-    if (emoji.length > 32 || /\s/.test(emoji)) {
-        await ctx.reply('Use one emoji without spaces, for example /linepackcreate <LINE pack URL> 🎉 | My Sticker Pack.');
-      return;
-    }
-
-    const status = await ctx.reply(recreateExisting
-      ? '⏳ Rebuilding the Telegram pack…'
-      : '⏳ Downloading and preparing the LINE pack for Telegram…');
-    try {
-      const [download, me] = await Promise.all([
-        downloadLinePackZip(pack, 'static'),
-        ctx.api.getMe(),
-      ]);
-      if (!me.username || !ctx.from) throw new Error('The bot or admin account could not be identified.');
-
-      let lastProgressEdit = 0;
-      const result = await createLineTelegramPack(
-        ctx.api,
-        pack,
-        download.buffer,
-        ctx.from.id,
-        me.username,
-        emoji,
-        customTitle,
-        async (progress) => {
-          const now = Date.now();
-          if (now - lastProgressEdit < 1_500 && progress.completed < progress.total) return;
-          lastProgressEdit = now;
-          const ratio = progress.total > 0 ? progress.completed / progress.total : 0;
-          const filled = Math.min(12, Math.floor(ratio * 12));
-          const bar = `${'█'.repeat(filled)}${'░'.repeat(12 - filled)}`;
-          const action = progress.phase === 'preparing' ? 'Preparing' : 'Adding to';
-          const text = `⏳ ${action} ${progress.packTitle} (${progress.partNumber}/${progress.partCount})\n` +
-            `${bar} ${Math.floor(ratio * 100)}%\n${progress.completed}/${progress.total} stickers`;
-          await ctx.api.editMessageText(ctx.chat.id, status.message_id, text).catch(() => {});
-        },
-        recreateExisting,
-      );
-      const progress = result.parts.reduce((sum, part) => sum + Math.min(part.count, part.total), 0);
-      const partLinks = result.parts.filter((part) => part.count > 0).map((part) =>
-        `${part.title} — ${part.count}/${part.total}\n${part.url}`,
-      ).join('\n');
-      const message = result.completed
-        ? `✅ Created ${result.parts.length} Telegram pack${result.parts.length === 1 ? '' : 's'} with all ${result.total} stickers.\n\n${partLinks}`
-        : `⏳ Pack creation progress: ${progress}/${result.total} stickers.\n` +
-            `${result.timeBudgetReached ? 'This pack exceeded one Vercel request’s time limit.' : 'The pack is not finished yet.'} ` +
-            `Send the same /linepackcreate command again to resume from saved progress.\n${partLinks}`;
-      await ctx.api.editMessageText(ctx.chat.id, status.message_id, message, { link_preview_options: { is_disabled: true } });
-    } catch (err) {
-      logSafeError('linepackcreate', err);
-      const message = 'Could not create this Telegram pack. Please check the pack details and try again.';
-      await ctx.api.editMessageText(ctx.chat.id, status.message_id, `❌ ${message}`).catch(async () => {
-        await ctx.reply(`❌ ${message}`);
-      });
-    }
   });
 
   // ---- Admin: set mode (one or more expressions for caption-free uploads) ----
@@ -1710,10 +1566,10 @@ export function createBot() {
   });
 
   // ---- Media ingestion: handle private admin uploads via /mode ----
-  bot.on(['message:animation', 'message:video'], async (ctx) => {
+  bot.on(['message:animation', 'message:video'], async (ctx, next) => {
     if (ctx.chat?.type !== 'private') return;
     if (!ctx.message) return;
-    if (!(await isBotAdmin(ctx.from?.id))) return;
+    if (!(await isBotAdmin(ctx.from?.id))) return next();
 
     const file = ctx.message.animation ?? ctx.message.video;
     if (!file) return;
@@ -1788,7 +1644,7 @@ export function createBot() {
     }
 
     const activeNames = ctx.session?.activeExpressions ?? (ctx.session?.activeExpression ? [ctx.session.activeExpression] : []);
-    if (activeNames.length === 0) return;
+    if (activeNames.length === 0) return next();
 
     const expressions: Expression[] = [];
     for (const name of activeNames) {
@@ -2070,6 +1926,8 @@ export function createBot() {
       { cache_time: 300, button: { text: 'Use /help in private', start_parameter: 'inline_off' } },
     );
   });
+
+  registerStickerFeatures(bot, isBotAdmin);
 
   return bot;
 }

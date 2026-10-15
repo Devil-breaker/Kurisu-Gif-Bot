@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildLinePackZipUrl, parseLinePackUrl } from '../../src/services/line-stickers.js';
+import { buildLinePackZipUrl, parseLinePackUrl } from '../../src/stickers/line/download.js';
 
 describe('LINE sticker pack URL handling', () => {
   it('accepts official sticker pack URLs and builds static and animated CDN links', () => {
