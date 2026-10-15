@@ -130,6 +130,7 @@ export function buildUserCommandsPanel(expressions: Expression[]): BuiltMessage 
   lines.push(
     '',
     '<b>🔧 Utility</b>',
+    '  • <code>/ping</code> – bot status, response latency, database, and uptime',
     '  • <code>/stats</code> – usage statistics',
     '  • <code>/sauce</code> – reverse search an image, GIF, video, or sticker',
     '',
@@ -237,7 +238,8 @@ export function buildBotAdminPanel(isOwner: boolean): BuiltMessage {
     '',
     '<b>🔍 Utilities</b>',
     '  • <code>/stats</code> – usage statistics',
-    '  • <code>/dedupe</code> – merge duplicate GIFs',
+    '  • <code>/dedupe</code> – preview likely visual duplicates',
+    '  • <code>/dedupe apply</code> – merge matches after reviewing the preview',
     '',
   );
 
@@ -326,6 +328,7 @@ export function buildHelpMessage(expressions: Expression[]): BuiltMessage {
   lines.push(
     '',
     '<b>🔧 Utility</b>',
+    '  • <code>/ping</code> – bot status, response latency, database, and uptime',
     '  • <code>/stats</code> – usage statistics',
     '  • <code>/sauce</code> – reverse search an image, GIF, video, or sticker',
     '',

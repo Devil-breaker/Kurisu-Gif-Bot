@@ -384,6 +384,45 @@ async function sendHtml(ctx: Context, label: string, built: BuiltMessage, quoted
   await ctx.reply(quoted ? quoteMenuText(built.text) : built.text, { parse_mode: 'HTML' });
 }
 
+interface DedupeRow {
+  id: number;
+  phash: string;
+  usage_count: number;
+  channel_msg_id: number | null;
+}
+
+function findVisualDuplicateGroups(rows: DedupeRow[]): number[][] {
+  const parent = new Map<number, number>();
+  const find = (id: number): number => {
+    if (!parent.has(id)) parent.set(id, id);
+    if (parent.get(id) !== id) parent.set(id, find(parent.get(id)!));
+    return parent.get(id)!;
+  };
+
+  for (let i = 0; i < rows.length; i++) {
+    for (let j = i + 1; j < rows.length; j++) {
+      const distance = hammingDistance(rows[i].phash, rows[j].phash);
+      if (distance >= 0 && distance <= 8) {
+        const left = find(rows[i].id);
+        const right = find(rows[j].id);
+        if (left !== right) parent.set(left, right);
+      }
+    }
+  }
+
+  const groups = new Map<number, number[]>();
+  for (const row of rows) {
+    const root = find(row.id);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root)!.push(row.id);
+  }
+
+  return [...groups.values()]
+    .filter((ids) => ids.length > 1)
+    .map((ids) => ids.sort((a, b) => a - b))
+    .sort((a, b) => a[0] - b[0]);
+}
+
 /** Create bot instance and configure middleware */
 export function createBot() {
   const config = loadConfig();
@@ -563,12 +602,28 @@ export function createBot() {
   // ---- Command: /ping ----
   bot.command('ping', async (ctx) => {
     const start = Date.now();
-    // Send initial "Pong!" message
+    // Send immediately so database checks do not delay the basic response.
     const pongMsg = await ctx.reply('🏓 Pong!').catch(() => null);
-    const latency = Date.now() - start;
+    const responseLatency = Date.now() - start;
     const uptime = formatUptime(Date.now() - PROCESS_START_TIME);
+    let databaseStatus = '❌ Unavailable';
+    try {
+      const dbStart = Date.now();
+      await getDb().execute('SELECT 1');
+      databaseStatus = `✅ Connected (${Date.now() - dbStart} ms)`;
+    } catch (err) {
+      logApiError('ping:database', err);
+    }
+    const runtime = process.env.VERCEL === '1' ? 'Vercel function instance' : 'Polling process';
 
-    const response = `🏓 <b>Pong!</b>\n\n📊 <b>Uptime:</b> ${uptime}\n⚡ <b>Latency:</b> ${latency}ms`;
+    const response = [
+      '🏓 <b>Pong!</b>',
+      '',
+      '🟢 <b>Status:</b> Online',
+      `⚡ <b>Telegram response:</b> ${responseLatency} ms`,
+      `🗄 <b>Database:</b> ${databaseStatus}`,
+      `⏱ <b>${runtime} uptime:</b> ${uptime}`,
+    ].join('\n');
 
     if (pongMsg) {
       await ctx.api.editMessageText(
@@ -1211,69 +1266,93 @@ export function createBot() {
       await ctx.reply('❌ Only admins can run deduplication.');
       return;
     }
-    const processing = await ctx.reply('🔍 Scanning for duplicate GIFs…');
+    const mode = (ctx.match?.trim() ?? '').toLowerCase();
+    if (mode && mode !== 'preview' && mode !== 'apply') {
+      await ctx.reply('Usage: /dedupe to preview matches, or /dedupe apply to merge them.');
+      return;
+    }
+    const apply = mode === 'apply';
+    const processing = await ctx.reply(apply ? '🧹 Merging duplicate GIF records…' : '🔍 Previewing possible duplicate GIFs…');
 
-    let totalMerged = 0;
-    let batchScanned = 0;
     const SCAN_CAP = 500;
 
     try {
-      const result = await getDb().execute({
-        sql: 'SELECT id, file_id, file_unique_id, phash, usage_count, is_lewd, created_at FROM media WHERE phash IS NOT NULL ORDER BY id LIMIT ?',
-        args: [SCAN_CAP],
-      });
+      const [result, missingHashes] = await Promise.all([
+        getDb().execute({
+          sql: 'SELECT id, phash, usage_count, channel_msg_id FROM media WHERE phash IS NOT NULL ORDER BY id LIMIT ?',
+          args: [SCAN_CAP],
+        }),
+        getDb().execute('SELECT COUNT(*) AS count FROM media WHERE phash IS NULL'),
+      ]);
+      const rows = result.rows as unknown as DedupeRow[];
+      const groups = findVisualDuplicateGroups(rows);
+      const totalToMerge = groups.reduce((count, ids) => count + ids.length - 1, 0);
+      const missingHashCount = Number(missingHashes.rows[0]?.count ?? 0);
+      const hitCap = rows.length >= SCAN_CAP;
 
-      const rows = result.rows as unknown as Array<{ id: number; file_id: string; file_unique_id: string; phash: string; usage_count: number; is_lewd: number; created_at: string }>;
-      batchScanned = rows.length;
+      if (!apply) {
+        const lines = [
+          `🔎 Dedupe preview: scanned ${rows.length}${hitCap ? ` of at least ${SCAN_CAP}` : ''} hashed GIF records.`,
+        ];
 
-      // Group rows by visual similarity using union-find
-      const parent = new Map<number, number>();
-      const find = (x: number): number => {
-        if (!parent.has(x)) parent.set(x, x);
-        if (parent.get(x) !== x) parent.set(x, find(parent.get(x)!));
-        return parent.get(x)!;
-      };
+        if (groups.length === 0) {
+          lines.push('No likely duplicate groups found.');
+        } else {
+          lines.push(`Found ${groups.length} group(s); applying would merge ${totalToMerge} record(s) into the oldest record in each group:`, '');
+          const rowById = new Map(rows.map((row) => [row.id, row]));
+          for (const ids of groups) {
+            const primary = rowById.get(ids[0])!;
+            const keepLabel = `Keep #${primary.id}${primary.channel_msg_id === null ? '' : ` (post ${primary.channel_msg_id})`}`;
+            for (let start = 1; start < ids.length; start += 20) {
+              const duplicates = ids.slice(start, start + 20).map((id) => {
+                const row = rowById.get(id)!;
+                return `#${id}${row.channel_msg_id === null ? '' : ` (post ${row.channel_msg_id})`}`;
+              });
+              lines.push(`${keepLabel}; merge ${duplicates.join(', ')}`);
+            }
+          }
+          lines.push('', 'Review the full list above, then run /dedupe apply to merge matches in this scanned set.');
+        }
 
-      for (let i = 0; i < rows.length; i++) {
-        for (let j = i + 1; j < rows.length; j++) {
-          const dist = hammingDistance(rows[i].phash, rows[j].phash);
-          if (dist >= 0 && dist <= 8) {
-            const pi = find(rows[i].id);
-            const pj = find(rows[j].id);
-            if (pi !== pj) parent.set(pi, pj);
+        if (missingHashCount > 0) {
+          lines.push('', `${missingHashCount} record(s) without perceptual hashes were skipped. Run the phash backfill script, then preview again.`);
+        }
+        if (hitCap) lines.push(`Only the first ${SCAN_CAP} hashed records are covered; records beyond that limit are not included in this preview or apply.`);
+
+        const chunks: string[] = [];
+        let chunk = '';
+        for (const line of lines) {
+          const next = chunk ? `${chunk}\n${line}` : line;
+          if (next.length > 3500 && chunk) {
+            chunks.push(chunk);
+            chunk = line;
+          } else {
+            chunk = next;
           }
         }
+        if (chunk) chunks.push(chunk);
+
+        await ctx.api.editMessageText(processing.chat.id, processing.message_id, chunks[0]);
+        for (const continuation of chunks.slice(1)) await ctx.reply(continuation);
+        return;
       }
 
-      // Build groups: primary = lowest id in each group
-      const groups = new Map<number, number[]>();
-      for (const row of rows) {
-        const root = find(row.id);
-        if (!groups.has(root)) groups.set(root, []);
-        groups.get(root)!.push(row.id);
-      }
-
-      for (const [, ids] of groups) {
-        if (ids.length < 2) continue;
-        // Sort by id asc → primary = lowest id
-        ids.sort((a, b) => a - b);
+      let totalMerged = 0;
+      for (const ids of groups) {
         const [primaryId, ...duplicateIds] = ids;
-        for (const dupId of duplicateIds) {
-          try {
-            await mergeMedia(primaryId, dupId);
-            totalMerged++;
-          } catch {
-            /* row may already be gone or links moved by a prior run */
-          }
+        for (const duplicateId of duplicateIds) {
+          await mergeMedia(primaryId, duplicateId);
+          totalMerged++;
         }
       }
 
-      const hitCap = batchScanned >= SCAN_CAP;
       await ctx.api.editMessageText(
         processing.chat.id,
         processing.message_id,
-        `✅ Merged ${totalMerged} duplicate GIF${totalMerged === 1 ? '' : 's'} into the oldest copy.`
-        + (hitCap ? ' (capped at ' + batchScanned + ' rows — run again to continue).' : ''),
+        `✅ Merged ${totalMerged} duplicate GIF record${totalMerged === 1 ? '' : 's'} into the oldest record.`
+        + (totalMerged === 0 ? ' No matches were found.' : '')
+        + (hitCap ? ` Only the first ${SCAN_CAP} hashed records were included.` : '')
+        + (missingHashCount > 0 ? ` ${missingHashCount} record(s) without perceptual hashes were skipped.` : ''),
       );
     } catch (err) {
       logApiError('dedupe', err);
