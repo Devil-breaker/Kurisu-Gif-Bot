@@ -35,7 +35,7 @@ npm install
 ### 2. Configure Environment
 Copy `.env.example` to `.env` and fill in:
 ```env
-BOT_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+BOT_TOKEN=your_botfather_token_here
 ADMIN_IDS=123456789,987654321   # comma-separated numeric user IDs
 
 # Optional

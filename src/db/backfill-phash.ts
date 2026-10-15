@@ -14,6 +14,7 @@ import { writeFile, rm, mkdtemp } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
+import { logSafeError } from '../services/safe-log.js';
 import { createClient } from '@libsql/client';
 import * as dotenv from 'dotenv';
 
@@ -168,6 +169,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('Backfill failed:', err);
+  logSafeError('backfill-phash', err);
   process.exit(1);
 });

@@ -4,6 +4,7 @@ import { runMigrations } from './client.js';
 import { createExpression } from './queries.js';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
+import { logSafeError } from '../services/safe-log.js';
 
 /**
  * direction:
@@ -72,6 +73,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(err);
+  logSafeError('seed', err);
   process.exit(1);
 });

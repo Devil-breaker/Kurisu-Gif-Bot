@@ -3,6 +3,7 @@ import { inflateRawSync } from 'node:zlib';
 import { InputFile } from 'grammy';
 import { getFfmpegPath } from './ffmpeg.js';
 import type { ParsedLinePack } from './line-stickers.js';
+import { logSafeError } from './safe-log.js';
 
 const MAX_ZIP_ENTRIES = 2048;
 const MAX_EXPANDED_ZIP_BYTES = 32 * 1024 * 1024;
@@ -325,7 +326,7 @@ export async function createLineTelegramPack(
       } catch (error) {
         // Keep processing a valid existing set when Telegram refuses a rename.
         // The completion message will report the title Telegram actually has.
-        console.warn(`[linepackcreate] Could not rename existing set ${name}:`, error);
+        logSafeError('linepackcreate:rename', error);
         if (isStickerSetInvalid(error)) {
           try {
             const current = await api.getStickerSet(name);

@@ -1,6 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import { buildBotCommands, createBot } from '../src/bot.js';
 import { loadConfig } from '../src/config.js';
+import { logSafeError } from '../src/services/safe-log.js';
 
 // grammY docs: a webhook function must return an explicit response and must
 // not let the bot process update processing errors uncaught — wrap in try/catch.
@@ -47,7 +48,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     await bot.handleUpdate(req.body as never);
     res.status(200).json({ ok: true });
   } catch (err) {
-    console.error('handleUpdate failed:', err);
+    logSafeError('webhook:handleUpdate', err);
     // Always 200 for Telegram so it doesn't retry-spam; the error is logged.
     res.status(200).json({ ok: false });
   }

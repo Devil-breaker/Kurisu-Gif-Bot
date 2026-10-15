@@ -2,6 +2,7 @@ import { createClient } from '@libsql/client';
 import { runMigrations } from './client.js';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
+import { logSafeError } from '../services/safe-log.js';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
@@ -18,6 +19,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('Migration failed:', err);
+  logSafeError('migration', err);
   process.exit(1);
 });

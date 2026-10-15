@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { createClient, type Client } from '@libsql/client';
 import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
+import { logSafeError } from '../services/safe-log.js';
 import { runMigrations } from './client.js';
 
 type LocalExpression = {
@@ -113,6 +114,6 @@ async function main() {
 }
 
 main().catch((err: unknown) => {
-  console.error('Local SQLite to Turso import failed:', err);
+  logSafeError('local-to-turso-import', err);
   process.exitCode = 1;
 });

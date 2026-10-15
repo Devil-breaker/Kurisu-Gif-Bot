@@ -1,3 +1,5 @@
+import { logSafeError } from './safe-log.js';
+
 export interface AniListMediaMetadata {
   year?: number;
   format?: string;
@@ -52,7 +54,7 @@ export async function getAniListMediaMetadata(id: number): Promise<AniListMediaM
       anidbUrl: safeAniDbUrl,
     };
   } catch (err) {
-    console.warn('[sauce] AniList metadata lookup failed:', (err as Error).message);
+    logSafeError('sauce:anilist', err);
     return null;
   }
 }

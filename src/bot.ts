@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { Context } from 'grammy';
-import { Bot, GrammyError, HttpError, InputFile, session } from 'grammy';
+import { Bot, InputFile, session } from 'grammy';
 
 
 /** Sessions live in the configured database so polling and webhook instances share state. */
@@ -83,6 +83,7 @@ import { reverseSearch } from './services/sauce.js';
 import { downloadLinePackZip, parseLinePackUrl } from './services/line-stickers.js';
 import { createLineTelegramPack } from './services/line-sticker-create.js';
 import { computePhash, hammingDistance } from './services/phash.js';
+import { logSafeError, safeErrorSummary } from './services/safe-log.js';
 import { TELEGRAM_CAPTION_LIMIT, clampVisible, formatCaption } from './services/caption.js';
 import {
   buildAdminsMessage,
@@ -138,7 +139,7 @@ async function cleanupRemovedUploadItems(
     const remaining = remainingItems.filter((item) => item.mediaId === mediaId);
     if (remaining.length === 0 && removed.some((item) => item.deleteMediaOnRemove)) {
       await deleteMediaById(mediaId).catch((err) => {
-        console.error('[remove] channel post deleted but database cleanup failed:', err);
+        logSafeError('remove:database-cleanup', err);
       });
       continue;
     }
@@ -147,7 +148,7 @@ async function cleanupRemovedUploadItems(
     // row at another surviving copy from this upload session.
     if (remaining.length > 0 && removed.some((item) => item.deleteMediaOnRemove)) {
       await setMediaChannelMsgId(mediaId, remaining[0].channelMsgId).catch((err) => {
-        console.error('[remove] could not relink surviving channel copy:', err);
+        logSafeError('remove:relink', err);
       });
     }
 
@@ -156,7 +157,7 @@ async function cleanupRemovedUploadItems(
       const stillUsed = remaining.some((item) => item.expressionIds?.includes(expressionId));
       if (!stillUsed) {
         await unlinkMediaFromExpression(mediaId, expressionId).catch((err) => {
-          console.error('[remove] could not undo expression tag:', err);
+          logSafeError('remove:expression-rollback', err);
         });
       }
     }
@@ -185,35 +186,10 @@ function formatUptime(ms: number): string {
   return `${seconds}s`;
 }
 
-/**
- * Report a failed Bot API call with the detail needed to fix it.
- *
- * A bare `console.error(err)` on a GrammyError prints the message but not the
- * payload, which is where the cause always is: the parse_mode in force and the
- * text that failed to parse. Length is logged because Telegram measures it
- * after entity parsing, so the number that matters is not the one in the
- * source. The snippet is capped — captions can be 1024 characters.
- */
-function logApiError(label: string, err: unknown, extra: Record<string, unknown> = {}): void {
-  if (err instanceof GrammyError) {
-    const payload = err.payload as Record<string, unknown>;
-    const body = (payload?.text ?? payload?.caption) as string | undefined;
-    console.error(`[${label}] Telegram rejected ${err.method}:`, {
-      error_code: err.error_code,
-      description: err.description,
-      parse_mode: payload?.parse_mode ?? '(none)',
-      chat_id: payload?.chat_id,
-      body_length: body?.length,
-      body_snippet: body?.slice(0, 300),
-      ...extra,
-    });
-    return;
-  }
-  if (err instanceof HttpError) {
-    console.error(`[${label}] Could not reach Telegram:`, err.error, extra);
-    return;
-  }
-  console.error(`[${label}]`, err, extra);
+function logApiError(label: string, err: unknown, _extra: Record<string, unknown> = {}): void {
+  // Grammy errors can contain the Bot instance and update context. Avoid logging
+  // payload text, Context, request URLs, or arbitrary nested error objects.
+  logSafeError(label, err);
 }
 
 /** Download a file from Telegram servers to a Buffer. */
@@ -394,15 +370,7 @@ export function createBot() {
   // ---- Error handling ----
   bot.catch((err) => {
     const ctx = err.ctx;
-    // Which update caused it is as important as the error: without this, a
-    // recurring failure cannot be tied to a command, chat, or user.
-    logApiError('unhandled', err.error, {
-      update_id: ctx.update.update_id,
-      update_type: Object.keys(ctx.update).filter((k) => k !== 'update_id').join(','),
-      chat_id: ctx.chat?.id,
-      from_id: ctx.from?.id,
-      text: ctx.message?.text?.slice(0, 120),
-    });
+    logApiError('unhandled', err.error);
     if (ctx.chat) {
       ctx.reply(
         '❌ An internal error occurred. The admins have been notified.',
@@ -688,7 +656,7 @@ export function createBot() {
       if (err.code === 'SQLITE_CONSTRAINT_UNIQUE') {
         await ctx.reply(`❌ Expression /${name} already exists.`);
       } else {
-        console.error('[addexpression] Failed to create expression:', err);
+        logSafeError('addexpression', err);
         await ctx.reply('❌ Failed to add expression.');
       }
       return;
@@ -789,7 +757,7 @@ export function createBot() {
       await addAdmin(userId, username, ctx.from?.id ?? 0);
       await ctx.reply(`✅ User ${username ? `@${username}` : userId} added as admin.`);
     } catch (err) {
-      console.error('[addadmin] Failed to add admin:', err);
+      logSafeError('addadmin', err);
       await ctx.reply('❌ Failed to add admin.');
     }
   });
@@ -835,7 +803,7 @@ export function createBot() {
         await ctx.reply(`❌ User ${userId} was not an admin.`);
       }
     } catch (err) {
-      console.error('[rmadmin] Failed to remove admin:', err);
+      logSafeError('rmadmin', err);
       await ctx.reply('❌ Failed to remove admin.');
     }
   });
@@ -896,8 +864,8 @@ export function createBot() {
       );
       await ctx.api.deleteMessage(ctx.chat.id, status.message_id).catch(() => {});
     } catch (err) {
-      console.error('[linepack] Failed to download LINE pack:', err);
-      const message = err instanceof Error ? err.message : 'Could not download this LINE pack.';
+      logSafeError('linepack', err);
+      const message = 'Could not download this LINE pack. Please check the URL and try again.';
       await ctx.api.editMessageText(ctx.chat.id, status.message_id, `❌ ${message}`).catch(async () => {
         await ctx.reply(`❌ ${message}`);
       });
@@ -991,8 +959,8 @@ export function createBot() {
             `Send the same /linepackcreate command again to resume from saved progress.\n${partLinks}`;
       await ctx.api.editMessageText(ctx.chat.id, status.message_id, message, { link_preview_options: { is_disabled: true } });
     } catch (err) {
-      console.error('[linepackcreate] Failed to create Telegram pack:', err);
-      const message = err instanceof Error ? err.message : 'Could not create this Telegram pack.';
+      logSafeError('linepackcreate', err);
+      const message = 'Could not create this Telegram pack. Please check the pack details and try again.';
       await ctx.api.editMessageText(ctx.chat.id, status.message_id, `❌ ${message}`).catch(async () => {
         await ctx.reply(`❌ ${message}`);
       });
@@ -1127,7 +1095,7 @@ export function createBot() {
         try {
           await ctx.api.deleteMessage(channelId, item.channelMsgId);
         } catch (err) {
-          const reason = err instanceof GrammyError ? err.description : (err as Error).message;
+          const reason = safeErrorSummary(err);
           failed.push({ messageId: item.channelMsgId, reason });
           remaining.push(item);
           continue;
@@ -1174,7 +1142,7 @@ export function createBot() {
     try {
       await ctx.api.deleteMessage(channelId, item.channelMsgId);
     } catch (err) {
-      const reason = err instanceof GrammyError ? err.description : (err as Error).message;
+      const reason = safeErrorSummary(err);
       const detail = /message can't be deleted/i.test(reason)
         ? 'Telegram usually means the post is older than 48 hours. Delete it manually in the channel; the bot API cannot remove it.'
         : `Telegram says: ${reason}. Check that the bot has permission to delete channel messages.`;
@@ -1723,7 +1691,7 @@ export function createBot() {
           }
         }
       } catch (err) {
-        console.warn('[dedupe] channel: could not compute phash:', err);
+        logSafeError('dedupe:channel-phash', err);
       }
 
       // Insert (or keep the existing row from dupe check)
@@ -1784,7 +1752,7 @@ export function createBot() {
             if (duplicate) media = duplicate.media;
           }
         } catch (err) {
-          console.warn('[rescan] could not compute phash:', err);
+          logSafeError('rescan:phash', err);
         }
       }
       if (!media) {
@@ -1861,7 +1829,7 @@ export function createBot() {
           }
         }
       } catch (err) {
-        console.warn('[dedupe] private upload: could not compute phash:', err);
+        logSafeError('dedupe:upload-phash', err);
       }
     }
 
@@ -1892,7 +1860,7 @@ export function createBot() {
         ctx.message.message_id,
         { caption: captionText, parse_mode: 'HTML' },
       ).catch((err) => {
-        console.warn('[upload] failed to copy to channel:', err.message);
+        logSafeError('upload:copy-channel', err);
         return null;
       });
 
@@ -2065,7 +2033,7 @@ export function createBot() {
           await ctx.api.deleteMessage(processing.chat.id, processing.message_id).catch(() => {});
           return;
         } catch (err) {
-          console.warn('[sauce] Could not send trace.moe clip as video; showing result card instead:', err);
+          logSafeError('sauce:send-clip', err);
         }
       }
 
@@ -2090,7 +2058,7 @@ export function createBot() {
       try {
         await rm(tmpDir, { recursive: true, force: true });
       } catch (err) {
-        console.warn('[sauce] Could not remove temp dir:', err);
+        logSafeError('sauce:remove-temp', err);
       }
     }
   });

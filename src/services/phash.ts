@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { getFfmpegPath } from './ffmpeg.js';
+import { logSafeError } from './safe-log.js';
 
 /** Hamming distance threshold for two dHashes to be considered near-duplicates. */
 export const PHASH_DUPLICATE_THRESHOLD = 8;
@@ -51,7 +52,7 @@ export async function computePhash(filePath: string): Promise<string | null> {
     // Trim to exactly 72 bytes if ffmpeg wrote extra (should not happen, but be safe)
     return dHashFromGray(buf.subarray(0, 72));
   } catch (err) {
-    console.warn('[phash] computePhash failed:', err);
+    logSafeError('phash', err);
     return null;
   }
 }

@@ -6,6 +6,7 @@ import { searchIqdb } from './iqdb.js';
 import { extractFrames } from './ffmpeg.js';
 import { rm } from 'node:fs/promises';
 import type { CombinedSauceResult, IqdbResult, SauceNaoResult, TraceMoeResult } from '../types/index.js';
+import { logSafeError } from './safe-log.js';
 
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -129,7 +130,7 @@ export async function reverseSearch(
         }
       } catch (err) {
         traceMoeFailed = true;
-        console.error('trace.moe search failed:', err);
+        logSafeError('sauce:trace-moe', err);
         if (/trace\.moe HTTP (?:400|413)/i.test((err as Error).message)) break;
       }
     }
@@ -145,7 +146,7 @@ export async function reverseSearch(
           }
         } catch (err) {
           sauceNaoFailed = true;
-          console.error('SauceNAO search failed:', err);
+          logSafeError('sauce:saucenao', err);
         }
       }
     }
@@ -157,7 +158,7 @@ export async function reverseSearch(
         iqdb = await searchIqdb(frames[0]);
       } catch (err) {
         iqdbFailed = true;
-        console.warn('[sauce] IQDB search failed; keeping the existing fallback result:', err);
+        logSafeError('sauce:iqdb', err);
       }
     }
 
@@ -187,7 +188,7 @@ export async function reverseSearch(
     };
   } finally {
     await rm(dir, { recursive: true, force: true }).catch((err) => {
-      console.warn('[sauce] Could not remove extracted frames:', err);
+      logSafeError('sauce:remove-frames', err);
     });
   }
 }

@@ -1,12 +1,13 @@
 import 'dotenv/config';
 import { buildBotCommands, createBot } from './bot.js';
+import { logSafeError } from './services/safe-log.js';
 
 async function main() {
   console.log('Starting Kurisu Gif Bot (long polling)...');
   const bot = createBot();
 
   // Replaces the previous default menu, removing dynamic expressions/aliases.
-  await bot.api.setMyCommands(buildBotCommands()).catch((err) => console.warn('Could not set commands:', err));
+  await bot.api.setMyCommands(buildBotCommands()).catch((err) => logSafeError('commands:register', err));
 
   // Auto-migrate local DB on startup (no-op for Turso if schema already applied)
   const { getDb } = await import('./db/client.js');
@@ -15,7 +16,7 @@ async function main() {
     await runMigrations(getDb());
     console.log('Database schema ready.');
   } catch (err) {
-    console.warn('Migration warning (may already be applied):', err);
+    logSafeError('migration', err);
   }
 
   await bot.start({
@@ -26,6 +27,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('Failed to start bot:', err);
+  logSafeError('startup', err);
   process.exit(1);
 });
