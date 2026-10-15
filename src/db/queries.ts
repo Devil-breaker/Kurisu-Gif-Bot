@@ -98,6 +98,26 @@ export async function getMediaByFileUniqueId(fileUniqueId: string): Promise<Medi
   return result.rows[0] as unknown as Media;
 }
 
+/** Mark media as lewd only for one chat; this does not alter its global label. */
+export async function markMediaLewdInChat(chatId: number, mediaId: number, markedBy: number): Promise<void> {
+  const db = getDb();
+  await db.execute({
+    sql: `INSERT INTO chat_lewd_media (chat_id, media_id, marked_by) VALUES (?, ?, ?)
+          ON CONFLICT(chat_id, media_id) DO UPDATE SET marked_by = excluded.marked_by`,
+    args: [chatId, mediaId, markedBy],
+  });
+}
+
+/** Remove a chat-specific lewd override. */
+export async function unmarkMediaLewdInChat(chatId: number, mediaId: number): Promise<boolean> {
+  const db = getDb();
+  const result = await db.execute({
+    sql: 'DELETE FROM chat_lewd_media WHERE chat_id = ? AND media_id = ?',
+    args: [chatId, mediaId],
+  });
+  return result.rowsAffected > 0;
+}
+
 /**
  * Upsert a media record, keyed on file_unique_id.
  * If phash is provided, stores it; ON CONFLICT uses COALESCE so an existing
@@ -195,10 +215,17 @@ export async function mergeMedia(primaryId: number, duplicateId: number): Promis
           SELECT ?, expression_id FROM media_expressions WHERE media_id = ?`,
     args: [primaryId, duplicateId],
   });
+  await db.execute({
+    sql: `INSERT INTO chat_lewd_media (chat_id, media_id, marked_by, created_at)
+          SELECT chat_id, ?, marked_by, created_at FROM chat_lewd_media WHERE media_id = ?
+          ON CONFLICT(chat_id, media_id) DO NOTHING`,
+    args: [primaryId, duplicateId],
+  });
   const moved = await db.execute({
     sql: 'DELETE FROM media_expressions WHERE media_id = ?',
     args: [duplicateId],
   });
+  await db.execute({ sql: 'DELETE FROM chat_lewd_media WHERE media_id = ?', args: [duplicateId] });
   // Delete the duplicate media row
   await db.execute({ sql: 'DELETE FROM media WHERE id = ?', args: [duplicateId] });
   return moved.rowsAffected > 0;
@@ -250,7 +277,8 @@ export async function unlinkMediaFromExpression(mediaId: number, expressionId: n
 
 export async function getRandomMediaForExpression(
   expressionId: number,
-  allowLewd = false
+  allowLewd = false,
+  chatId?: number,
 ): Promise<Media | null> {
   const db = getDb();
   const lewdClause = allowLewd ? '' : 'AND m.is_lewd = 0';
@@ -258,8 +286,13 @@ export async function getRandomMediaForExpression(
     sql: `SELECT m.* FROM media m
           JOIN media_expressions me ON me.media_id = m.id
           WHERE me.expression_id = ? ${lewdClause}
-          ORDER BY RANDOM() LIMIT 1`,
-    args: [expressionId],
+            AND (? IS NULL OR NOT EXISTS (
+              SELECT 1 FROM chat_lewd_media clm WHERE clm.chat_id = ? AND clm.media_id = m.id
+            ))
+          -- Balance use across the eligible library; break ties randomly so
+          -- similarly used GIFs still feel unpredictable.
+          ORDER BY m.usage_count ASC, RANDOM() LIMIT 1`,
+    args: [expressionId, chatId ?? null, chatId ?? null],
   });
   if (result.rows.length === 0) return null;
   return result.rows[0] as unknown as Media;
@@ -297,7 +330,7 @@ export async function getMediaStats(): Promise<{ expression: string; count: numb
   }));
 }
 
-export async function getAvailableExpressionNames(allowLewd = false): Promise<string[]> {
+export async function getAvailableExpressionNames(allowLewd = false, chatId?: number): Promise<string[]> {
   const db = getDb();
   const result = await db.execute({
     sql: `SELECT DISTINCT e.name
@@ -305,14 +338,21 @@ export async function getAvailableExpressionNames(allowLewd = false): Promise<st
           JOIN media_expressions me ON me.expression_id = e.id
           JOIN media m ON m.id = me.media_id
           WHERE (? = 1 OR (e.is_lewd = 0 AND m.is_lewd = 0))
+            AND (? IS NULL OR NOT EXISTS (
+              SELECT 1 FROM chat_lewd_media clm WHERE clm.chat_id = ? AND clm.media_id = m.id
+            ))
           ORDER BY e.name`,
-    args: [allowLewd ? 1 : 0],
+    args: [allowLewd ? 1 : 0, chatId ?? null, chatId ?? null],
   });
   return result.rows.map((row) => row.name as string);
 }
 
 export async function deleteMediaByFileUniqueId(fileUniqueId: string): Promise<boolean> {
   const db = getDb();
+  await db.execute({
+    sql: 'DELETE FROM chat_lewd_media WHERE media_id = (SELECT id FROM media WHERE file_unique_id = ?)',
+    args: [fileUniqueId],
+  });
   const result = await db.execute({
     sql: 'DELETE FROM media WHERE file_unique_id = ?',
     args: [fileUniqueId],
@@ -323,6 +363,7 @@ export async function deleteMediaByFileUniqueId(fileUniqueId: string): Promise<b
 export async function deleteMediaById(mediaId: number): Promise<boolean> {
   const db = getDb();
   await db.execute({ sql: 'DELETE FROM media_expressions WHERE media_id = ?', args: [mediaId] });
+  await db.execute({ sql: 'DELETE FROM chat_lewd_media WHERE media_id = ?', args: [mediaId] });
   const result = await db.execute({ sql: 'DELETE FROM media WHERE id = ?', args: [mediaId] });
   return result.rowsAffected > 0;
 }

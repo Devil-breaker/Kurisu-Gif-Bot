@@ -1,18 +1,12 @@
 import 'dotenv/config';
-import { createBot } from './bot.js';
+import { buildBotCommands, createBot } from './bot.js';
 
 async function main() {
   console.log('Starting Kurisu Gif Bot (long polling)...');
   const bot = createBot();
 
-  // Seed the /commands menu so users see expressions in the UI
-  bot.api.setMyCommands([
-    { command: 'start', description: 'Start the bot & show help' },
-    { command: 'help', description: 'Show help message' },
-    { command: 'listexpressions', description: 'List all available expressions' },
-    { command: 'stats', description: 'Show usage stats per expression' },
-    { command: 'sauce', description: 'Reverse search a replied image, GIF, video, or sticker' },
-  ]).catch((err) => console.warn('Could not set commands:', err));
+  // Replaces the previous default menu, removing dynamic expressions/aliases.
+  await bot.api.setMyCommands(buildBotCommands()).catch((err) => console.warn('Could not set commands:', err));
 
   // Auto-migrate local DB on startup (no-op for Turso if schema already applied)
   const { getDb } = await import('./db/client.js');

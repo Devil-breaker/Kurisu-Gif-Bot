@@ -50,6 +50,8 @@ import {
   deleteExpression,
   updateCaptionTemplate,
   getMediaByFileUniqueId,
+  markMediaLewdInChat,
+  unmarkMediaLewdInChat,
   insertMedia,
   setMediaChannelMsgId,
   setMediaChannelMsgIdIfMissing,
@@ -241,32 +243,9 @@ async function computeTelegramFilePhash(ctx: Context, fileId: string): Promise<s
   }
 }
 
-/**
- * Telegram's own rule for a command in the /commands menu: 1-32 characters,
- * lowercase letters, digits and underscores only. An expression named
- * "high-five" (one ships in the seed data) makes setMyCommands 400, which
- * takes down the whole menu and not just that one entry.
- */
-const VALID_BOT_COMMAND = /^[a-z0-9_]{1,32}$/;
-
-/** setMyCommands accepts at most 100 commands per scope. */
-const MAX_BOT_COMMANDS = 100;
-
-/**
- * Build the /commands menu. Exported for the tests: every name here has to
- * satisfy Telegram's charset rule, and the only way to be sure of that without
- * a live API call is to assert on this function's output.
- */
-export function buildBotCommands(
-  expressions: Expression[],
-): Array<{ command: string; description: string }> {
-  const safe: Expression[] = [];
-  const lewd: Expression[] = [];
-  for (const expr of expressions) {
-    (expr.is_lewd ? lewd : safe).push(expr);
-  }
-
-  const cmds: Array<{ command: string; description: string }> = [
+/** Build Telegram's slash menu without the dynamic expression commands. */
+export function buildBotCommands(): Array<{ command: string; description: string }> {
+  return [
     { command: 'start', description: 'Start the bot & show help' },
     { command: 'help', description: 'Show this help message' },
     { command: 'addexpression', description: 'Admin: add a new expression' },
@@ -283,47 +262,13 @@ export function buildBotCommands(
     { command: 'stats', description: 'Show usage stats per expression' },
     { command: 'ping', description: 'Check bot uptime and latency' },
     { command: 'sauce', description: 'Reverse search a replied image, GIF, video, or sticker' },
+    { command: 'lewdmode', description: 'Toggle Lewd Mode (NSFW) in this chat' },
   ];
-
-  if (safe.length > 0) {
-    cmds.push({ command: 'lewdmode', description: 'Toggle Lewd Mode (NSFW) in this chat' });
-  }
-
-  // Safe commands first, then lewd ones: the menu is truncated from the end if
-  // it overflows, and a lewd command is the one to lose.
-  for (const expr of [...safe, ...lewd]) {
-    cmds.push({ command: expr.name, description: `Send a random ${expr.name} GIF` });
-    for (const alias of expr.aliases) {
-      cmds.push({ command: alias, description: `Send a random ${expr.name} GIF (alias)` });
-    }
-  }
-
-  const valid = cmds.filter((c) => {
-    if (VALID_BOT_COMMAND.test(c.command)) return true;
-    // Not fatal: the expression still works as a typed command, it just cannot
-    // appear in the menu. Named here so the cause is findable.
-    console.warn(
-      `[commands] Skipping "/${c.command}" in the /commands menu: Telegram allows only 1-32 chars of a-z, 0-9 and _`,
-    );
-    return false;
-  });
-
-  if (valid.length > MAX_BOT_COMMANDS) {
-    console.warn(
-      `[commands] ${valid.length} commands exceeds Telegram's limit of ${MAX_BOT_COMMANDS}; dropping ${valid.length - MAX_BOT_COMMANDS}`,
-    );
-    return valid.slice(0, MAX_BOT_COMMANDS);
-  }
-  return valid;
 }
 
-/** Refresh the bot's command list from expressions in DB. */
-async function refreshBotCommands(bot: Bot<BotContext>): Promise<void> {
-  const expressions = await listExpressions();
-  const commands = buildBotCommands(expressions);
-  await bot.api.setMyCommands(commands);
-  console.log(`[commands] /commands menu updated (${commands.length} entries)`);
-}
+// Telegram command tokens only allow this character set. Expression names use
+// the same validation even though expressions are no longer in the slash menu.
+const VALID_BOT_COMMAND = /^[a-z0-9_]{1,32}$/;
 
 /**
  * Whether the sender is the bot owner (full access).
@@ -701,14 +646,6 @@ export function createBot() {
       `✅ Expression /${name} added${aliases.length ? ` with aliases: ${aliases.join(', ')}` : ''}${dirNote}.`,
     );
 
-    // Outside the try above: the expression exists either way, so a failed
-    // menu refresh must not report the add itself as failed.
-    try {
-      await refreshBotCommands(bot);
-    } catch (err) {
-      logApiError('addexpression:refresh', err);
-      await ctx.reply('⚠️ Expression added, but the /commands menu could not be refreshed.');
-    }
   });
 
   // ---- Admin: delete expression ----
@@ -728,12 +665,6 @@ export function createBot() {
       return;
     }
     await ctx.reply(`✅ Expression /${name} deleted.`);
-    try {
-      await refreshBotCommands(bot);
-    } catch (err) {
-      logApiError('deleteexpression:refresh', err);
-      await ctx.reply('⚠️ Expression deleted, but the /commands menu could not be refreshed.');
-    }
   });
 
   // ---- Admin: update caption template ----
@@ -1482,6 +1413,52 @@ export function createBot() {
     await ctx.reply(`✅ Bluetext mode is now ${enabled ? 'ON' : 'OFF'} in this chat.`);
   });
 
+  // ---- Group admins: apply chat-only lewd labels to bot-sent GIFs ----
+  bot.on('message:text', async (ctx, next) => {
+    const text = ctx.message.text.trim().toLowerCase();
+    if (text !== '#lewd' && text !== '#safe') return next();
+
+    const chatType = ctx.chat?.type;
+    if (chatType !== 'group' && chatType !== 'supergroup') return next();
+    const replied = ctx.message.reply_to_message;
+    if (!replied) return next();
+
+    if (!(await canManageChat(ctx))) {
+      await ctx.reply('❌ Only group admins can apply this group-only GIF label.');
+      return;
+    }
+
+    const settings = await getChatSettings(ctx.chat.id);
+    if (settings.lewd_mode === 1) {
+      await ctx.reply('Turn Lewd Mode off before applying group-only #lewd or #safe labels.');
+      return;
+    }
+
+    if (replied.from?.id !== ctx.me.id) {
+      await ctx.reply('Reply to a GIF sent by this bot with #lewd or #safe.');
+      return;
+    }
+
+    const fileUniqueId = replied.animation?.file_unique_id ?? replied.video?.file_unique_id;
+    if (!fileUniqueId) {
+      await ctx.reply('The replied bot message does not contain a GIF or video.');
+      return;
+    }
+    const media = await getMediaByFileUniqueId(fileUniqueId);
+    if (!media) {
+      await ctx.reply('I could not match that GIF to the library.');
+      return;
+    }
+
+    if (text === '#lewd') {
+      await markMediaLewdInChat(ctx.chat.id, media.id, ctx.from.id);
+      await ctx.reply('🔞 Marked lewd in this group. It will be filtered while Lewd Mode is off. Reply with #safe to undo.');
+    } else {
+      const removed = await unmarkMediaLewdInChat(ctx.chat.id, media.id);
+      await ctx.reply(removed ? '✅ Removed this group-only lewd label.' : 'This GIF has no group-only lewd label to remove.');
+    }
+  });
+
   // ---- Dynamic expression command handler (catch-all for command messages) ----
   bot.on('message:text', async (ctx, next) => {
     const text = ctx.message.text;
@@ -1544,11 +1521,13 @@ export function createBot() {
       return;
     }
 
-    // Pick a random media, respecting lewd filter
+    // Group-specific #lewd overrides apply only while Lewd Mode is off.
     const allowLewd = chatSettings.lewd_mode === 1;
-    const media = await getRandomMediaForExpression(expression.id, allowLewd);
+    const isGroup = ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup';
+    const chatLewdFilter = isGroup && !allowLewd ? chatId : undefined;
+    const media = await getRandomMediaForExpression(expression.id, allowLewd, chatLewdFilter);
     if (!media) {
-      const available = (await getAvailableExpressionNames(allowLewd)).map((name) => `/${name}`);
+      const available = (await getAvailableExpressionNames(allowLewd, chatLewdFilter)).map((name) => `/${name}`);
       const message = available.length
         ? `No GIFs are available for /${expression.name} yet. Try: ${available.join(' ')}`
         : 'No GIF commands have GIFs available yet.';
@@ -1577,7 +1556,6 @@ export function createBot() {
       await incrementUsage(media.id);
 
       // Bluetext: delete the invoking command message if enabled and in a group
-      const isGroup = ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup';
       if (isGroup && chatSettings.bluetext === 0) {
         // Needs "delete messages" rights, which the bot often does not have;
         // logged rather than swallowed so the cause is visible.

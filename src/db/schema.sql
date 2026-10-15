@@ -26,6 +26,15 @@ CREATE TABLE IF NOT EXISTS chat_settings (
   disabled_commands TEXT NOT NULL DEFAULT '[]'
 );
 
+-- Group-specific lewd overrides. These never change the global media label.
+CREATE TABLE IF NOT EXISTS chat_lewd_media (
+  chat_id INTEGER NOT NULL,
+  media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+  marked_by INTEGER NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+  PRIMARY KEY (chat_id, media_id)
+);
+
 CREATE TABLE IF NOT EXISTS media_expressions (
   media_id INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
   expression_id INTEGER NOT NULL REFERENCES expressions(id) ON DELETE CASCADE,

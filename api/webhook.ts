@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { createBot } from '../src/bot.js';
+import { buildBotCommands, createBot } from '../src/bot.js';
 import { loadConfig } from '../src/config.js';
 
 // grammY docs: a webhook function must return an explicit response and must
@@ -10,7 +10,10 @@ let botInitialization: Promise<void> | undefined;
 
 function initializeBot(): Promise<void> {
   if (!botInitialization) {
-    botInitialization = bot.init().catch((err: unknown) => {
+    botInitialization = bot.init().then(async () => {
+      // Replace the prior default menu, which may still contain expressions.
+      await bot.api.setMyCommands(buildBotCommands());
+    }).catch((err: unknown) => {
       // Allow a later webhook invocation to retry if Telegram or the network
       // is temporarily unavailable during initialization.
       botInitialization = undefined;
