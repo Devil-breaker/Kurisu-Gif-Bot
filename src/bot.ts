@@ -220,30 +220,14 @@ async function computeTelegramFilePhash(ctx: Context, fileId: string): Promise<s
   }
 }
 
-/** Build Telegram's slash menu without the dynamic expression commands. */
+/** Build Telegram's intentionally small slash menu. Other handlers remain usable directly. */
 export function buildBotCommands(): Array<{ command: string; description: string }> {
   return [
     { command: 'start', description: 'Start the bot & show help' },
     { command: 'help', description: 'Show this help message' },
-    { command: 'addexpression', description: 'Admin: add a new expression' },
-    { command: 'listexpressions', description: 'List all available expressions' },
-    { command: 'deleteexpression', description: 'Admin: delete an expression by name' },
-    { command: 'updatecaption', description: 'Admin: update caption template for an expression' },
-    { command: 'admins', description: 'List bot admins' },
-    { command: 'addadmin', description: 'Admin: add by user ID or replied message' },
-    { command: 'rmadmin', description: 'Admin: remove an admin by user ID' },
-    { command: 'mode', description: 'Admin: set expressions for GIF uploads' },
-    { command: 'rescan', description: 'Admin: re-index old channel posts by forwarding them here' },
-    { command: 'remove', description: 'Admin: remove a mistakenly uploaded GIF from the dump channel' },
-    { command: 'done', description: 'Admin: signal you are done uploading GIFs' },
-    { command: 'supported', description: 'Admin: list sticker conversion formats' },
-    { command: 'convert', description: 'Admin: convert one media file for Telegram stickers' },
-    { command: 'batchconvert', description: 'Admin: convert several files for Telegram stickers' },
-    { command: 'stats', description: 'Show usage stats per expression' },
     { command: 'ping', description: 'Check bot uptime and latency' },
     { command: 'sauce', description: 'Reverse search a replied image, GIF, video, or sticker' },
-    { command: 'lewdmode', description: 'Toggle Lewd Mode (NSFW) in this chat' },
-    { command: 'lewdgifs', description: 'Review GIFs hidden in this group' },
+    { command: 'listexpressions', description: 'List all available expressions' },
   ];
 }
 

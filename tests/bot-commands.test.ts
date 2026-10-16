@@ -2,15 +2,10 @@ import { describe, it, expect } from 'vitest';
 import { buildBotCommands } from '../src/bot.js';
 
 describe('buildBotCommands', () => {
-  it('includes fixed utility and admin commands but omits dynamic expressions', () => {
+  it('registers only the requested commands in Telegram’s slash menu', () => {
     const commands = buildBotCommands();
     const names = commands.map((c) => c.command);
-    for (const expected of ['start', 'help', 'listexpressions', 'stats', 'sauce', 'lewdmode', 'supported', 'convert', 'batchconvert']) {
-      expect(names).toContain(expected);
-    }
-    expect(names).not.toContain('hug');
-    expect(names).not.toContain('hugs');
-    expect(names).not.toContain('pat');
+    expect(names).toEqual(['start', 'help', 'ping', 'sauce', 'listexpressions']);
   });
 
   it('only emits valid Telegram command tokens', () => {
