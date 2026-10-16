@@ -233,6 +233,7 @@ export function buildBotAdminPanel(isOwner: boolean): BuiltMessage {
     '  • <code>/rescan</code> – re-index old posts by forwarding them here',
     '  • <code>/rescan relink</code> – update references to surviving channel posts',
     '  • <code>/remove &lt;N|all&gt;</code> – delete GIF(s) from channel',
+    '  • Reply to a GIF sent by the bot with <code>/remove</code> to remove it from the library and delete its archive post.',
     '  • <code>/linepack &lt;LINE URL&gt; [static|animated]</code> – download a LINE pack ZIP',
     '  • <code>/linepackcreate &lt;LINE URL&gt; [emoji] [--recreate] | [pack name]</code> – create named Telegram pack(s) from a LINE pack',
     '  • <code>/convert</code> – convert one file; reply to media or send the command, then the file',

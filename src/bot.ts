@@ -80,6 +80,7 @@ import {
 import { getDb } from './db/client.js';
 import { loadConfig } from './config.js';
 import { reverseSearch } from './services/sauce.js';
+import { removeCatalogMedia } from './services/media-removal.js';
 import { registerStickerFeatures, type StickerSession } from './stickers/register.js';
 import { computePhash, hammingDistance } from './services/phash.js';
 import { logSafeError, safeErrorSummary } from './services/safe-log.js';
@@ -1084,6 +1085,62 @@ export function createBot() {
   // ---- Admin: remove a mistakenly uploaded GIF from the dump channel ----
   bot.command('remove', async (ctx) => {
     if (!(await isBotAdmin(ctx.from?.id))) return;
+
+    const replied = ctx.message?.reply_to_message;
+    if (replied) {
+      if (replied.from?.id !== ctx.me.id) {
+        await ctx.reply('Reply to a GIF sent by this bot with /remove to remove it from the library.');
+        return;
+      }
+
+      const fileUniqueId = replied.animation?.file_unique_id ?? replied.video?.file_unique_id;
+      if (!fileUniqueId) {
+        await ctx.reply('The replied bot message does not contain a GIF or video.');
+        return;
+      }
+
+      const media = await getMediaByFileUniqueId(fileUniqueId);
+      if (!media) {
+        await ctx.reply('That GIF is not in the library, or it was already removed.');
+        return;
+      }
+
+      const result = await removeCatalogMedia(media, config.DUMP_CHANNEL_ID, {
+        deleteMedia: deleteMediaById,
+        deleteChannelMessage: (channelId, messageId) => ctx.api.deleteMessage(channelId, messageId),
+      });
+      if (result.status === 'database-error') {
+        logSafeError('remove:library-record', result.error);
+        await ctx.reply('❌ I could not remove that GIF from the library. Please try again.');
+        return;
+      }
+      if (result.status === 'missing') {
+        await ctx.reply('That GIF is not in the library, or it was already removed.');
+        return;
+      }
+
+      if (result.archive === 'delete-failed') {
+        logSafeError('remove:archive-post', result.error);
+        await ctx.reply(
+          '✅ Removed the GIF from the library, so it will no longer be sent. I could not delete its archive post; delete that post manually to prevent a future /rescan from adding it again.',
+        );
+        return;
+      }
+      if (result.archive === 'channel-not-configured') {
+        await ctx.reply(
+          '✅ Removed the GIF from the library, so it will no longer be sent. The archive channel is not configured here; delete the archive post manually to prevent a future /rescan from adding it again.',
+        );
+        return;
+      }
+
+      const completionMessage = result.archive === 'deleted'
+        ? '✅ Removed the GIF from the library and deleted its archive post.'
+        : result.archive === 'already-missing'
+          ? '✅ Removed the GIF from the library. Its archive post had already been deleted.'
+          : '✅ Removed the GIF from the library. It had no linked archive post.';
+      await ctx.reply(completionMessage);
+      return;
+    }
 
     const items = ctx.session?.uploadedItems ?? [];
     const count = items.length;
