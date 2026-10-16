@@ -39,8 +39,8 @@ describe('mode picker', () => {
     const keyboard = buildModePickerKeyboard(expressions, [1, 9], 0);
     const labels = keyboard.inline_keyboard.flat().map((button) => button.text);
 
-    expect(labels).toContain('✅ /expression_1');
-    expect(labels).not.toContain('✅ /expression_9');
+    expect(labels).toContain('✅ expression_1');
+    expect(labels).not.toContain('✅ expression_9');
     expect(labels).not.toContain('/expression_9');
     expect(labels).toContain('Next ▶️');
     expect(keyboard.inline_keyboard.flat().map((button) => button.callback_data)).toContain('modepick:t:1:0');

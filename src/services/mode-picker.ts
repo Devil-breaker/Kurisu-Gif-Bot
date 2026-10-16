@@ -57,7 +57,7 @@ export function buildModePickerKeyboard(
 
   for (let index = 0; index < visible.length; index += 2) {
     rows.push(visible.slice(index, index + 2).map((expression) => ({
-      text: `${selected.has(expression.id) ? '✅ ' : ''}/${expression.name}`,
+      text: `${selected.has(expression.id) ? '✅ ' : ''}${expression.name}`,
       callback_data: `modepick:t:${expression.id}:${page}`,
     })));
   }
