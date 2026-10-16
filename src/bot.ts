@@ -102,6 +102,12 @@ import {
   CALLBACK_DATA,
   type BuiltMessage,
 } from './services/messages.js';
+import {
+  buildModePickerKeyboard,
+  buildModePickerText,
+  clampModePickerPage,
+  parseModePickerCallbackData,
+} from './services/mode-picker.js';
 import type { Expression } from './types/index.js';
 
 interface UploadSessionItem {
@@ -117,6 +123,9 @@ interface BotContext extends Context {
   session?: {
     activeExpression?: string;
     activeExpressions?: string[];
+    modePickerMessageId?: number;
+    modePickerSelectedIds?: number[];
+    modePickerPage?: number;
     rescanActive?: boolean;
     rescanMode?: 'index' | 'relink';
     rescannedCount?: number;
@@ -276,6 +285,134 @@ async function canManageChat(ctx: Context): Promise<boolean> {
     // Fall through to bot-admin check
   }
   return isBotAdmin(ctx.from.id);
+}
+
+async function handleModePickerCallback(ctx: BotContext, data: string): Promise<void> {
+  let callbackAnswered = false;
+  const answer = async (options?: { text?: string; show_alert?: boolean }) => {
+    if (callbackAnswered) return;
+    callbackAnswered = true;
+    await ctx.answerCallbackQuery(options).catch((err) => logApiError('mode-picker:answer', err));
+  };
+
+  try {
+    if (ctx.chat?.type !== 'private' || !ctx.chat.id || !ctx.from) {
+      await answer({ text: 'Open the picker in a private chat with the bot.', show_alert: true });
+      return;
+    }
+    if (!(await isBotAdmin(ctx.from.id))) {
+      await answer({ text: 'Only bot admins can change upload expressions.', show_alert: true });
+      return;
+    }
+    if (ctx.session?.conversionMode) {
+      await answer({ text: 'Finish sticker conversion before changing upload mode.', show_alert: true });
+      return;
+    }
+
+    const messageId = ctx.callbackQuery?.message?.message_id;
+    if (!messageId || ctx.session?.modePickerMessageId !== messageId) {
+      await answer({ text: 'This picker has expired. Send /mode to open a new one.', show_alert: true });
+      return;
+    }
+
+    const callback = parseModePickerCallbackData(data);
+    if (!callback || !ctx.session) {
+      await answer({ text: 'This button is no longer valid. Send /mode to reopen the picker.', show_alert: true });
+      return;
+    }
+
+    const expressions = await listExpressions();
+    const expressionsById = new Map(expressions.map((expression) => [expression.id, expression]));
+    const selected = new Set((ctx.session.modePickerSelectedIds ?? []).filter((id) => expressionsById.has(id)));
+
+    if (callback.action === 'toggle') {
+      if (!expressionsById.has(callback.expressionId)) {
+        const page = clampModePickerPage(ctx.session.modePickerPage ?? callback.page, expressions.length);
+        ctx.session.modePickerPage = page;
+        await ctx.api.editMessageText(ctx.chat.id, messageId, buildModePickerText(expressions, [...selected], page), {
+          parse_mode: 'HTML',
+          reply_markup: buildModePickerKeyboard(expressions, [...selected], page),
+        });
+        await answer({ text: 'That expression was removed; the picker has been refreshed.', show_alert: true });
+        return;
+      }
+      if (selected.has(callback.expressionId)) selected.delete(callback.expressionId);
+      else selected.add(callback.expressionId);
+      ctx.session.modePickerPage = clampModePickerPage(callback.page, expressions.length);
+    } else if (callback.action === 'page') {
+      ctx.session.modePickerPage = clampModePickerPage(callback.page, expressions.length);
+    } else if (callback.action === 'clear') {
+      selected.clear();
+    } else if (callback.action === 'apply') {
+      const activeExpressions = [...selected]
+        .map((id) => expressionsById.get(id))
+        .filter((expression): expression is Expression => expression !== undefined)
+        .sort((a, b) => a.name.localeCompare(b.name));
+      if (activeExpressions.length === 0) {
+        await answer({ text: 'Select at least one expression, or choose Stop upload mode.', show_alert: true });
+        return;
+      }
+      const names = activeExpressions.map((expression) => expression.name);
+      ctx.session.activeExpressions = names;
+      ctx.session.activeExpression = names[0];
+      delete ctx.session.modePickerMessageId;
+      delete ctx.session.modePickerSelectedIds;
+      delete ctx.session.modePickerPage;
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        messageId,
+        `✅ Upload mode set to ${names.map((name) => `/${name}`).join(', ')}. Each GIF will use these expressions until you change the mode or send /done.`,
+      );
+      await answer({ text: 'Upload mode updated.' });
+      return;
+    } else if (callback.action === 'stop') {
+      delete ctx.session.activeExpressions;
+      delete ctx.session.activeExpression;
+      delete ctx.session.modePickerMessageId;
+      delete ctx.session.modePickerSelectedIds;
+      delete ctx.session.modePickerPage;
+      await ctx.api.editMessageText(
+        ctx.chat.id,
+        messageId,
+        '🛑 Upload mode stopped. Existing uploads remain in this session; new GIFs will be ignored until you set a mode again.',
+      );
+      await answer({ text: 'Upload mode stopped.' });
+      return;
+    } else if (callback.action === 'cancel') {
+      delete ctx.session.modePickerMessageId;
+      delete ctx.session.modePickerSelectedIds;
+      delete ctx.session.modePickerPage;
+      await ctx.api.editMessageText(ctx.chat.id, messageId, 'Mode selection cancelled. Your current upload mode is unchanged.');
+      await answer({ text: 'Cancelled.' });
+      return;
+    }
+
+    const validSelectedIds = [...selected].filter((id) => expressionsById.has(id));
+    ctx.session.modePickerSelectedIds = validSelectedIds;
+    const page = clampModePickerPage(ctx.session.modePickerPage ?? 0, expressions.length);
+    ctx.session.modePickerPage = page;
+    await ctx.api.editMessageText(ctx.chat.id, messageId, buildModePickerText(expressions, validSelectedIds, page), {
+      parse_mode: 'HTML',
+      reply_markup: buildModePickerKeyboard(expressions, validSelectedIds, page),
+    });
+    await answer();
+  } catch (err) {
+    logApiError('mode-picker:callback', err);
+    await answer({ text: 'Could not update the picker. Please try again or send /mode to reopen it.', show_alert: true });
+  }
+}
+
+async function invalidateModePicker(ctx: BotContext): Promise<void> {
+  const messageId = ctx.session?.modePickerMessageId;
+  if (ctx.session) {
+    delete ctx.session.modePickerMessageId;
+    delete ctx.session.modePickerSelectedIds;
+    delete ctx.session.modePickerPage;
+  }
+  if (messageId && ctx.chat?.type === 'private') {
+    await ctx.api.editMessageReplyMarkup(ctx.chat.id, messageId, { reply_markup: { inline_keyboard: [] } })
+      .catch((err) => logApiError('mode-picker:invalidate', err));
+  }
 }
 
 /**
@@ -441,6 +578,11 @@ export function createBot() {
         caption: `🔞 <b>Hidden in this group</b> · ${currentPage + 1} of ${count}\nLewd Mode off filters this GIF from reactions.`,
         parse_mode: 'HTML',
       }, { reply_markup: { inline_keyboard: rows } }).catch((err) => logApiError('group-lewd-browser:edit', err));
+      return;
+    }
+
+    if (data.startsWith('modepick:')) {
+      await handleModePickerCallback(ctx, data);
       return;
     }
 
@@ -815,18 +957,39 @@ export function createBot() {
       await ctx.reply('❌ Only admins can use /mode.');
       return;
     }
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply('Please use /mode in a private chat with the bot to prepare GIF uploads.');
+      return;
+    }
     if (ctx.session?.conversionMode) {
       await ctx.reply('Finish sticker conversion first with /convert cancel or /batchconvert done.');
       return;
     }
-    const requestedNames = (ctx.match?.trim() ?? '')
+    const modeInput = ctx.match?.trim() ?? '';
+    if (!modeInput) {
+      const expressions = await listExpressions();
+      if (expressions.length === 0) {
+        await ctx.reply('No expressions are configured yet. Add one with /addexpression first.');
+        return;
+      }
+      await invalidateModePicker(ctx);
+      const activeNames = new Set(ctx.session?.activeExpressions ?? (ctx.session?.activeExpression ? [ctx.session.activeExpression] : []));
+      const selectedIds = expressions.filter((expression) => activeNames.has(expression.name)).map((expression) => expression.id);
+      const page = clampModePickerPage(0, expressions.length);
+      const message = await ctx.reply(buildModePickerText(expressions, selectedIds, page), {
+        parse_mode: 'HTML',
+        reply_markup: buildModePickerKeyboard(expressions, selectedIds, page),
+      });
+      ctx.session!.modePickerMessageId = message.message_id;
+      ctx.session!.modePickerSelectedIds = selectedIds;
+      ctx.session!.modePickerPage = page;
+      return;
+    }
+
+    const requestedNames = modeInput
       .split(/[\s,]+/)
       .map((name) => name.replace(/^#/, '').toLowerCase())
       .filter(Boolean);
-    if (requestedNames.length === 0) {
-      await ctx.reply('Usage: /mode <expression> [expression ...]\nExample: /mode hug kiss');
-      return;
-    }
     if (requestedNames.includes('lewd')) {
       await ctx.reply('Use #lewd in an individual GIF caption to mark that upload as lewd. /mode accepts expression names only.');
       return;
@@ -842,6 +1005,7 @@ export function createBot() {
       await ctx.reply(`❌ Unknown expression${unknown.length === 1 ? '' : 's'}: ${unknown.map((name) => `/${name}`).join(', ')}.`);
       return;
     }
+    await invalidateModePicker(ctx);
     const activeExpressions = [...expressions.values()];
     const activeNames = activeExpressions.map((expression) => expression.name);
     ctx.session!.activeExpressions = activeNames;
@@ -912,7 +1076,7 @@ export function createBot() {
       (skippedDuplicateCount > 0
         ? `⏭️ Skipped ${skippedDuplicateCount} duplicate upload${skippedDuplicateCount === 1 ? '' : 's'}; ${duplicateTagCount} new expression tag${duplicateTagCount === 1 ? '' : 's'} added to existing GIFs.\n\n`
         : '') +
-      `Ready for another batch — send /mode &lt;expression&gt; [expression ...] to start.`,
+      `Ready for another batch — send /mode to pick expressions, or /mode hug kiss to set them directly.`,
       { parse_mode: 'HTML' },
     );
   });

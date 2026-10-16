@@ -227,8 +227,8 @@ export function buildBotAdminPanel(isOwner: boolean): BuiltMessage {
   lines.push(
     '',
     '<b>📤 Media Upload</b>',
-    '  • <code>/mode &lt;expr&gt; [expr ...]</code> – tag uploads with one or more expressions',
-    '  Example: <code>/mode hug kiss</code> tags each upload for both commands.',
+    '  • <code>/mode</code> – open a paginated picker; tap expressions to select them, then Apply. The picker includes expressions added with /addexpression.',
+    '  • <code>/mode &lt;expr&gt; [expr ...]</code> – quick-set tags for uploads, e.g. <code>/mode hug kiss</code>. You can change mode mid-session; all selected tags apply to each GIF until changed.',
     '  Upload GIFs/video in private chat. Use <code>/remove</code> then <code>/remove N</code> to undo a mistaken upload before <code>/done</code>.',
     '  • <code>/rescan</code> – re-index old posts by forwarding them here',
     '  • <code>/rescan relink</code> – update references to surviving channel posts',
