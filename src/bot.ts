@@ -80,7 +80,7 @@ import {
 import { getDb } from './db/client.js';
 import { loadConfig } from './config.js';
 import { reverseSearch } from './services/sauce.js';
-import { registerStickerFeatures } from './stickers/register.js';
+import { registerStickerFeatures, type StickerSession } from './stickers/register.js';
 import { computePhash, hammingDistance } from './services/phash.js';
 import { logSafeError, safeErrorSummary } from './services/safe-log.js';
 import { TELEGRAM_CAPTION_LIMIT, clampVisible, formatCaption } from './services/caption.js';
@@ -124,7 +124,7 @@ interface BotContext extends Context {
     skippedDuplicateCount?: number;
     duplicateTagCount?: number;
     uploadedItems?: UploadSessionItem[];
-  };
+  } & StickerSession;
 }
 
 /** Undo only library records and expression links introduced by removed uploads. */
@@ -237,6 +237,8 @@ export function buildBotCommands(): Array<{ command: string; description: string
     { command: 'remove', description: 'Admin: remove a mistakenly uploaded GIF from the dump channel' },
     { command: 'done', description: 'Admin: signal you are done uploading GIFs' },
     { command: 'supported', description: 'Admin: list sticker conversion formats' },
+    { command: 'convert', description: 'Admin: convert one media file for Telegram stickers' },
+    { command: 'batchconvert', description: 'Admin: convert several files for Telegram stickers' },
     { command: 'stats', description: 'Show usage stats per expression' },
     { command: 'ping', description: 'Check bot uptime and latency' },
     { command: 'sauce', description: 'Reverse search a replied image, GIF, video, or sticker' },
@@ -829,6 +831,10 @@ export function createBot() {
       await ctx.reply('❌ Only admins can use /mode.');
       return;
     }
+    if (ctx.session?.conversionMode) {
+      await ctx.reply('Finish sticker conversion first with /convert cancel or /batchconvert done.');
+      return;
+    }
     const requestedNames = (ctx.match?.trim() ?? '')
       .split(/[\s,]+/)
       .map((name) => name.replace(/^#/, '').toLowerCase())
@@ -868,6 +874,10 @@ export function createBot() {
   // ---- Admin: signal done uploading ----
   bot.command('done', async (ctx) => {
     if (!(await isBotAdmin(ctx.from?.id))) return;
+    if (ctx.session?.conversionMode) {
+      await ctx.reply('Use /convert cancel or /batchconvert done to finish sticker conversion.');
+      return;
+    }
     const wasRescan = ctx.session?.rescanActive ?? false;
     const rescannedCount = ctx.session?.rescannedCount ?? 0;
     const duplicateCount = wasRescan ? (ctx.session?.uploadedItems?.length ?? 0) : 0;
@@ -1031,6 +1041,10 @@ export function createBot() {
         ctx.session.rescannedCount = undefined;
       }
       await ctx.reply('Reindex mode stopped.');
+      return;
+    }
+    if (ctx.session?.conversionMode) {
+      await ctx.reply('Finish sticker conversion first with /convert cancel or /batchconvert done.');
       return;
     }
     ctx.session!.activeExpression = undefined;

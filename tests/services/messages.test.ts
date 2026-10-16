@@ -18,6 +18,7 @@ import {
 } from '../../src/services/caption.js';
 import {
   buildAdminsMessage,
+  buildBotAdminPanel,
   buildExpressionListMessage,
   buildHelpMessage,
   buildLocksMessage,
@@ -129,6 +130,17 @@ describe('message builders', () => {
 
     it('handles an empty expression list', () => {
       expectValidTelegramHtml(buildHelpMessage([]).text, TELEGRAM_MESSAGE_LIMIT);
+    });
+  });
+
+  describe('buildBotAdminPanel', () => {
+    it('documents explicit single-file and batch sticker conversion commands', () => {
+      const { text } = buildBotAdminPanel(false);
+      expect(text).toContain('<code>/convert</code>');
+      expect(text).toContain('<code>/batchconvert</code>');
+      expect(text).toContain('<code>/batchconvert done</code>');
+      expect(text).toContain('ordinary forwarded GIFs are ignored');
+      expectValidTelegramHtml(text, TELEGRAM_MESSAGE_LIMIT);
     });
   });
 

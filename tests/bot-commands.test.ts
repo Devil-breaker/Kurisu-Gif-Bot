@@ -5,7 +5,7 @@ describe('buildBotCommands', () => {
   it('includes fixed utility and admin commands but omits dynamic expressions', () => {
     const commands = buildBotCommands();
     const names = commands.map((c) => c.command);
-    for (const expected of ['start', 'help', 'listexpressions', 'stats', 'sauce', 'lewdmode']) {
+    for (const expected of ['start', 'help', 'listexpressions', 'stats', 'sauce', 'lewdmode', 'supported', 'convert', 'batchconvert']) {
       expect(names).toContain(expected);
     }
     expect(names).not.toContain('hug');

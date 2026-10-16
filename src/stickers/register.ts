@@ -2,6 +2,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Bot, Context, InputFile } from 'grammy';
+import type { Message } from 'grammy/types';
 import { loadConfig } from '../config.js';
 import { logSafeError } from '../services/safe-log.js';
 import {
@@ -17,9 +18,20 @@ import { downloadLinePackZip, parseLinePackUrl } from './line/download.js';
 
 type AdminCheck = (userId: number | undefined) => Promise<boolean>;
 
+export interface StickerSession {
+  activeExpression?: string;
+  activeExpressions?: string[];
+  rescanActive?: boolean;
+  conversionMode?: 'single' | 'batch';
+  conversionTotal?: number;
+  conversionConverted?: number;
+  conversionAlreadyReady?: number;
+  conversionFailed?: number;
+}
+
 const TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = 20_000;
 
-export function registerStickerFeatures<C extends Context>(bot: Bot<C>, isBotAdmin: AdminCheck): void {
+export function registerStickerFeatures<C extends Context & { session?: StickerSession }>(bot: Bot<C>, isBotAdmin: AdminCheck): void {
   registerLinePackCommands(bot, isBotAdmin);
   registerConversionCommands(bot, isBotAdmin);
 }
@@ -162,7 +174,7 @@ function registerLinePackCommands<C extends Context>(bot: Bot<C>, isBotAdmin: Ad
   });
 }
 
-function registerConversionCommands<C extends Context>(bot: Bot<C>, isBotAdmin: AdminCheck): void {
+function registerConversionCommands<C extends Context & { session?: StickerSession }>(bot: Bot<C>, isBotAdmin: AdminCheck): void {
   bot.command('supported', async (ctx) => {
     if (ctx.chat?.type !== 'private') {
       await ctx.reply('Use /supported in a private chat with the bot.');
@@ -175,90 +187,248 @@ function registerConversionCommands<C extends Context>(bot: Bot<C>, isBotAdmin: 
     await ctx.reply(
       '🧩 <b>Supported media for sticker conversion</b>\n\n' +
         STICKER_SUPPORTED_FORMATS.map((line) => `• ${escapeHtml(line)}`).join('\n') +
-        '\n\nSend a supported file to me in this private chat. I’ll return a converted file only when it needs conversion. Forward the result to <a href="https://t.me/Stickers">@Stickers</a> to add it to a pack. ' +
-        'Video sticker output uses the first 3 seconds of the source.',
+        '\n\nUse /convert for one file, or /batchconvert to start a multi-file session. The bot processes media only while one of those commands is active. ' +
+        'Forward the returned file to <a href="https://t.me/Stickers">@Stickers</a> to add it to a pack. Video sticker output uses up to the first 3 seconds.',
       { parse_mode: 'HTML', link_preview_options: { is_disabled: true } },
     );
   });
 
-  bot.on(['message:photo', 'message:document', 'message:animation', 'message:video', 'message:sticker'], async (ctx) => {
-    if (ctx.chat?.type !== 'private') return;
+  bot.command('convert', async (ctx) => {
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply('Use /convert in a private chat with the bot.');
+      return;
+    }
     if (!(await isBotAdmin(ctx.from?.id))) {
       await ctx.reply('❌ Sticker conversion tools are available to bot admins only.');
       return;
     }
 
-    const source = getStickerSource(ctx);
+    const action = (ctx.match?.trim() ?? '').toLowerCase();
+    if (action === 'cancel') {
+      if (ctx.session?.conversionMode === 'batch') {
+        await ctx.reply('A batch is active. Use /batchconvert cancel or /batchconvert done.');
+        return;
+      }
+      clearConversionSession(ctx.session);
+      await ctx.reply('Sticker conversion cancelled.');
+      return;
+    }
+    if (action) {
+      await ctx.reply('Usage: reply to a media message with /convert, or send /convert and then send one file. Use /convert cancel to cancel.');
+      return;
+    }
+    if (ctx.session?.conversionMode === 'batch') {
+      await ctx.reply('A batch is active. Use /batchconvert done or /batchconvert cancel before starting a single conversion.');
+      return;
+    }
+    if (hasActiveGifSession(ctx.session)) {
+      await ctx.reply('Finish the active /mode or /rescan session with /done before starting sticker conversion.');
+      return;
+    }
+
+    const repliedMessage = ctx.message?.reply_to_message;
+    if (repliedMessage) {
+      const source = getStickerSource(repliedMessage);
+      if (!source) {
+        await ctx.reply('The message you replied to does not contain a supported image, GIF, video, or sticker. Use /supported for formats.');
+        return;
+      }
+      clearConversionSession(ctx.session);
+      await convertStickerMedia(ctx, source, repliedMessage.message_id);
+      return;
+    }
+
+    clearConversionSession(ctx.session);
+    if (ctx.session) ctx.session.conversionMode = 'single';
+    await ctx.reply('Send one image, GIF, video, or sticker now. I’ll convert only that file. Use /convert cancel to stop.');
+  });
+
+  bot.command('batchconvert', async (ctx) => {
+    if (ctx.chat?.type !== 'private') {
+      await ctx.reply('Use /batchconvert in a private chat with the bot.');
+      return;
+    }
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      await ctx.reply('❌ Sticker conversion tools are available to bot admins only.');
+      return;
+    }
+
+    const action = (ctx.match?.trim() ?? '').toLowerCase();
+    if (action === 'done' || action === 'finish') {
+      if (ctx.session?.conversionMode !== 'batch') {
+        await ctx.reply('There is no active sticker conversion batch. Start one with /batchconvert.');
+        return;
+      }
+      const summary = buildBatchSummary(ctx.session);
+      clearConversionSession(ctx.session);
+      await ctx.reply(`✅ ${summary}`);
+      return;
+    }
+    if (action === 'cancel') {
+      if (ctx.session?.conversionMode !== 'batch') {
+        await ctx.reply('There is no active sticker conversion batch.');
+        return;
+      }
+      const summary = buildBatchSummary(ctx.session);
+      clearConversionSession(ctx.session);
+      await ctx.reply(`Sticker conversion batch cancelled. ${summary}`);
+      return;
+    }
+    if (action) {
+      await ctx.reply('Usage: /batchconvert to start, /batchconvert done to finish, or /batchconvert cancel to stop early.');
+      return;
+    }
+    if (ctx.session?.conversionMode === 'single') {
+      await ctx.reply('A single conversion is waiting for a file. Send it, or use /convert cancel before starting a batch.');
+      return;
+    }
+
+    if (hasActiveGifSession(ctx.session)) {
+      await ctx.reply('Finish the active /mode or /rescan session with /done before starting sticker conversion.');
+      return;
+    }
+
+    if (ctx.session?.conversionMode === 'batch') {
+      await ctx.reply('A sticker conversion batch is already active. Send more files, then use /batchconvert done when finished.');
+      return;
+    }
+    clearConversionSession(ctx.session);
+    if (ctx.session) {
+      ctx.session.conversionMode = 'batch';
+      ctx.session.conversionTotal = 0;
+      ctx.session.conversionConverted = 0;
+      ctx.session.conversionAlreadyReady = 0;
+      ctx.session.conversionFailed = 0;
+    }
+    await ctx.reply('Sticker conversion batch started. Send supported media one by one and wait for each result. I’ll process files only until you send /batchconvert done. Use /batchconvert cancel to stop.');
+  });
+
+  bot.on(['message:photo', 'message:document', 'message:animation', 'message:video', 'message:sticker'], async (ctx) => {
+    if (ctx.chat?.type !== 'private') return;
+    const mode = ctx.session?.conversionMode;
+    if (!mode) return;
+    if (!(await isBotAdmin(ctx.from?.id))) {
+      clearConversionSession(ctx.session);
+      await ctx.reply('❌ Sticker conversion tools are available to bot admins only.');
+      return;
+    }
+
+    const source = getStickerSource(ctx.message);
     if (!source) {
+      await countConversionOutcome(ctx.session, 'failed');
+      if (mode === 'single') clearConversionSession(ctx.session);
       await ctx.reply('I could not identify a supported media file. Send /supported for the format list.');
       return;
     }
-    if (source.fileSize !== undefined && source.fileSize > MAX_STICKER_INPUT_BYTES) {
-      await ctx.reply('❌ This file is too large to convert. The maximum input size is 20 MB.');
-      return;
-    }
-    if (source.kind === 'sticker') {
-      await ctx.reply('✅ This is already a Telegram sticker. No conversion is needed; forward the original sticker to @Stickers.');
-      return;
-    }
-
-    const status = await ctx.reply('⏳ Checking the media and preparing a Telegram sticker file…', {
-      reply_parameters: { message_id: ctx.msg.message_id },
-    });
-    let tempDir: string | undefined;
-    try {
-      tempDir = await mkdtemp(join(tmpdir(), 'sticker-convert-'));
-      const inputPath = join(tempDir, `input${extensionOf(source.fileName)}`);
-      const input = await downloadTelegramFile(ctx, source.fileId, source.fileSize);
-      await writeFile(inputPath, input);
-      const result = await convertForTelegramSticker(inputPath, source.fileName, input.length, source.kind);
-      if (result.alreadySuitable) {
-        await editStatus(ctx, status.message_id, '✅ This media already meets Telegram’s sticker file requirements. No converted file was needed; forward the original media to @Stickers.', 'sticker-convert:already-suitable');
-        return;
-      }
-      if (!result.buffer || !result.filename || !result.format) {
-        throw new Error('Conversion returned no output file.');
-      }
-
-      await ctx.api.sendDocument(
-        ctx.chat.id,
-        new InputFile(result.buffer, result.filename),
-        {
-          caption: result.format === 'video'
-            ? '✅ Video sticker file is ready. Forward this file to @Stickers to add it to a pack. Video stickers use up to the first 3 seconds.'
-            : '✅ Static sticker file is ready. Forward this file to @Stickers to add it to a pack.',
-          reply_parameters: { message_id: ctx.msg.message_id },
-        },
-      );
-      await ctx.api.deleteMessage(ctx.chat.id, status.message_id)
-        .catch((err) => logSafeError('sticker-convert:status-cleanup', err));
-    } catch (err) {
-      logSafeError('sticker-convert', err);
-      const message = err instanceof StickerConversionError
-        ? `❌ ${err.message}`
-        : '❌ I could not convert this media. Try a supported, smaller file or another format.';
-      await editStatus(ctx, status.message_id, message, 'sticker-convert:error');
-    } finally {
-      if (tempDir) {
-        await rm(tempDir, { recursive: true, force: true })
-          .catch((err) => logSafeError('sticker-convert:cleanup', err));
-      }
-    }
+    const outcome = await convertStickerMedia(ctx, source, ctx.msg.message_id);
+    await countConversionOutcome(ctx.session, outcome);
+    if (mode === 'single') clearConversionSession(ctx.session);
   });
 
   bot.on('message:text', async (ctx) => {
     if (ctx.chat?.type !== 'private' || ctx.message.text.startsWith('/')) return;
+    const mode = ctx.session?.conversionMode;
+    if (!mode) return;
     if (!(await isBotAdmin(ctx.from?.id))) return;
     await ctx.reply(
-      'Send an image, GIF, video, or sticker in this private chat and I’ll prepare a Telegram-ready file. Use /supported to see accepted formats. ' +
-        'For LINE sticker packs, use /linepack or /linepackcreate from the Bot Admin panel.',
+      mode === 'single'
+        ? 'I’m waiting for one supported media file. Send a file or use /convert cancel.'
+        : 'I’m waiting for the next supported media file. Continue sending files or use /batchconvert done to finish.',
       { reply_parameters: { message_id: ctx.message.message_id } },
     );
   });
 }
 
-function getStickerSource(ctx: Context): StickerSource | null {
-  const message = ctx.message;
+type ConversionOutcome = 'converted' | 'already-ready' | 'failed';
+
+async function convertStickerMedia(ctx: Context, source: StickerSource, sourceMessageId: number): Promise<ConversionOutcome> {
+  if (source.fileSize !== undefined && source.fileSize > MAX_STICKER_INPUT_BYTES) {
+    await ctx.reply('❌ This file is too large to convert. The maximum input size is 20 MB.', {
+      reply_parameters: { message_id: sourceMessageId },
+    });
+    return 'failed';
+  }
+  if (source.kind === 'sticker') {
+    await ctx.reply('✅ This is already a Telegram sticker. No conversion is needed; forward the original sticker to @Stickers.', {
+      reply_parameters: { message_id: sourceMessageId },
+    });
+    return 'already-ready';
+  }
+
+  const status = await ctx.api.sendMessage(ctx.chat!.id, '⏳ Checking the media and preparing a Telegram sticker file…', {
+    reply_parameters: { message_id: sourceMessageId },
+  });
+  let tempDir: string | undefined;
+  try {
+    tempDir = await mkdtemp(join(tmpdir(), 'sticker-convert-'));
+    const inputPath = join(tempDir, `input${extensionOf(source.fileName)}`);
+    const input = await downloadTelegramFile(ctx, source.fileId, source.fileSize);
+    await writeFile(inputPath, input);
+    const result = await convertForTelegramSticker(inputPath, source.fileName, input.length, source.kind);
+    if (result.alreadySuitable) {
+      await editStatus(ctx, status.message_id, '✅ This media already meets Telegram’s sticker file requirements. No converted file was needed; forward the original media to @Stickers.', 'sticker-convert:already-suitable');
+      return 'already-ready';
+    }
+    if (!result.buffer || !result.filename || !result.format) {
+      throw new Error('Conversion returned no output file.');
+    }
+
+    await ctx.api.sendDocument(
+      ctx.chat!.id,
+      new InputFile(result.buffer, result.filename),
+      {
+        caption: result.format === 'video'
+          ? '✅ Video sticker file is ready. Forward this file to @Stickers to add it to a pack. Video sticker output uses up to the first 3 seconds.'
+          : '✅ Static sticker file is ready. Forward this file to @Stickers to add it to a pack.',
+        reply_parameters: { message_id: sourceMessageId },
+      },
+    );
+    await ctx.api.deleteMessage(ctx.chat!.id, status.message_id)
+      .catch((err) => logSafeError('sticker-convert:status-cleanup', err));
+    return 'converted';
+  } catch (err) {
+    logSafeError('sticker-convert', err);
+    const message = err instanceof StickerConversionError
+      ? `❌ ${err.message}`
+      : '❌ I could not convert this media. Try a supported, smaller file or another format.';
+    await editStatus(ctx, status.message_id, message, 'sticker-convert:error');
+    return 'failed';
+  } finally {
+    if (tempDir) {
+      await rm(tempDir, { recursive: true, force: true })
+        .catch((err) => logSafeError('sticker-convert:cleanup', err));
+    }
+  }
+}
+
+async function countConversionOutcome(session: StickerSession | undefined, outcome: ConversionOutcome): Promise<void> {
+  if (!session || session.conversionMode !== 'batch') return;
+  session.conversionTotal = (session.conversionTotal ?? 0) + 1;
+  if (outcome === 'converted') session.conversionConverted = (session.conversionConverted ?? 0) + 1;
+  else if (outcome === 'already-ready') session.conversionAlreadyReady = (session.conversionAlreadyReady ?? 0) + 1;
+  else session.conversionFailed = (session.conversionFailed ?? 0) + 1;
+}
+
+function clearConversionSession(session: StickerSession | undefined): void {
+  if (!session) return;
+  session.conversionMode = undefined;
+  session.conversionTotal = undefined;
+  session.conversionConverted = undefined;
+  session.conversionAlreadyReady = undefined;
+  session.conversionFailed = undefined;
+}
+
+function buildBatchSummary(session: StickerSession): string {
+  const total = session.conversionTotal ?? 0;
+  return `Batch finished: ${total} file(s) processed — ${session.conversionConverted ?? 0} converted, ` +
+    `${session.conversionAlreadyReady ?? 0} already ready, ${session.conversionFailed ?? 0} failed or unsupported.`;
+}
+
+function hasActiveGifSession(session: StickerSession | undefined): boolean {
+  return Boolean(session?.activeExpression || session?.activeExpressions?.length || session?.rescanActive);
+}
+
+function getStickerSource(message: Message | undefined): StickerSource | null {
   if (!message) return null;
   if (message.sticker) {
     return {
