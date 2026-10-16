@@ -78,7 +78,7 @@ export const CALLBACK_DATA = {
 export function buildStartMessage(isAdmin: boolean, isOwner: boolean): { text: string; dropped: number } {
   let status = '👤 <b>User Access</b>';
   if (isOwner) {
-    status = '👑 <b>My Master!!</b>';
+    status = '👑 <b>Bot Owner</b>';
   } else if (isAdmin) {
     status = '⚙️ <b>Bot Admin</b>';
   }
