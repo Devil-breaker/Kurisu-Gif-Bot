@@ -45,25 +45,22 @@ export async function extractFrames(inputPath: string): Promise<ExtractedFrames>
   ];
 
   try {
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-      let stderr = '';
-      const timer = setTimeout(() => proc.kill(), 20_000);
-      proc.stderr?.on('data', (chunk: Buffer) => {
-        stderr = `${stderr}${chunk.toString()}`.slice(-4000);
-      });
-      proc.on('error', (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
-      proc.on('close', (code) => {
-        clearTimeout(timer);
-        if (code === 0) resolve();
-        else reject(new Error(`ffmpeg exited with ${code}: ${stderr.slice(-500)}`));
-      });
-    });
+    await runFfmpeg(ffmpeg, args);
 
-    const files = (await readdir(dir)).filter((f) => f.endsWith('.jpg')).sort();
+    let files = (await readdir(dir)).filter((f) => f.endsWith('.jpg')).sort();
+    if (files.length === 0) {
+      // A still image or very short clip may end before fps=1/2 emits a frame.
+      // Retry without the sampling filter so reverse search still gets one image.
+      await runFfmpeg(ffmpeg, [
+        '-y',
+        '-i', inputPath,
+        '-frames:v', '1',
+        '-vf', 'scale=640:640:force_original_aspect_ratio=decrease',
+        '-q:v', '4',
+        join(dir, 'frame_%04d.jpg'),
+      ]);
+      files = (await readdir(dir)).filter((f) => f.endsWith('.jpg')).sort();
+    }
     if (files.length === 0) throw new Error('No frames extracted from input');
 
     const total = files.length;
@@ -74,4 +71,25 @@ export async function extractFrames(inputPath: string): Promise<ExtractedFrames>
     await rm(dir, { recursive: true, force: true }).catch(() => {});
     throw err;
   }
+}
+
+async function runFfmpeg(ffmpeg: string, args: string[]): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn(ffmpeg, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    const timer = setTimeout(() => proc.kill(), 20_000);
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      stderr = `${stderr}${chunk.toString()}`.slice(-4000);
+    });
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    proc.on('close', (code, signal) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else if (signal === 'SIGTERM') reject(new Error('ffmpeg timed out while extracting frames'));
+      else reject(new Error(`ffmpeg exited with ${code}: ${stderr.slice(-500)}`));
+    });
+  });
 }

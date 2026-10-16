@@ -113,6 +113,23 @@ describe('ffmpeg service', () => {
       );
     });
 
+    it('retries with the first frame when the sampling filter drops a short or still image', async () => {
+      mockFfmpegExit(0);
+      (readdir as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce(['frame_0001.jpg']);
+
+      const result = await extractFrames('/fake/sticker.webp');
+
+      expect(result.frames).toHaveLength(1);
+      expect(result.frames[0]).toMatch(/frame_0001\.jpg$/);
+      expect(spawn).toHaveBeenCalledTimes(2);
+      const [, fallbackArgs] = (spawn as ReturnType<typeof vi.fn>).mock.calls[1]!;
+      expect(fallbackArgs).toContain('-frames:v');
+      expect(fallbackArgs).toContain('1');
+      expect(fallbackArgs.join(' ')).not.toContain('fps=1/2');
+    });
+
     it('succeeds with a single frame (all picks collapse to index 0)', async () => {
       mockFfmpegExit(0);
 
