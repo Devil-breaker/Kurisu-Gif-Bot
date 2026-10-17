@@ -11,7 +11,7 @@ import { logSafeError } from './safe-log.js';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 interface CachePayload {
-  version: 5;
+  version: 6;
   traceMoe: TraceMoeResult | null;
   sauceNao: SauceNaoResult | null;
   iqdb: IqdbResult | null;
@@ -44,7 +44,7 @@ export function parseCachePayload(json: string, now = Date.now()): CachePayload 
   }
 
   const row = parsed as Partial<CachePayload>;
-  if (row.version !== 5 || typeof row.sauceNaoConfigured !== 'boolean' || typeof row.searchComplete !== 'boolean') {
+  if (row.version !== 6 || typeof row.sauceNaoConfigured !== 'boolean' || typeof row.searchComplete !== 'boolean') {
     return null;
   }
   if (typeof row.cachedAt !== 'number' || !Number.isFinite(row.cachedAt)) {
@@ -56,7 +56,7 @@ export function parseCachePayload(json: string, now = Date.now()): CachePayload 
   if (age < 0 || age >= CACHE_TTL_MS) return null; // expired, or written by a skewed clock
 
   return {
-    version: 5,
+    version: 6,
     traceMoe: row.traceMoe ?? null,
     sauceNao: row.sauceNao ?? null,
     iqdb: row.iqdb ?? null,
@@ -168,7 +168,7 @@ export async function reverseSearch(
     const searchComplete = !traceMoeFailed && !sauceNaoFailed && !iqdbFailed;
     if (searchComplete) {
       const payload: CachePayload = {
-        version: 5,
+        version: 6,
         traceMoe,
         sauceNao,
         iqdb,

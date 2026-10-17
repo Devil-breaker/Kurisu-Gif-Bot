@@ -30,7 +30,7 @@ describe('sauce service', () => {
 
   describe('parseCachePayload', () => {
     const valid = {
-      version: 5,
+      version: 6,
       traceMoe: { animeTitle: 'X', similarity: 0.9, from: 1, to: 2, episode: 1 },
       sauceNao: null,
       iqdb: null,
@@ -48,6 +48,10 @@ describe('sauce service', () => {
     it('rejects a stale entry', () => {
       const stale = JSON.stringify({ ...valid, cachedAt: Date.now() - 25 * 60 * 60 * 1000 });
       expect(parseCachePayload(stale)).toBeNull();
+    });
+
+    it('invalidates pre-change cache entries', () => {
+      expect(parseCachePayload(JSON.stringify({ ...valid, version: 5 }))).toBeNull();
     });
 
     it('rejects a future cachedAt (clock skew or corrupt row)', () => {
@@ -75,7 +79,7 @@ describe('sauce service', () => {
     it('normalises missing provider fields to null', () => {
       const parsed = parseCachePayload(JSON.stringify({ ...valid, traceMoe: undefined, sauceNao: undefined, iqdb: undefined }));
       expect(parsed).toEqual({
-        version: 5,
+        version: 6,
         traceMoe: null,
         sauceNao: null,
         iqdb: null,
