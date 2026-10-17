@@ -48,6 +48,14 @@ export function classifyStickerDocument(fileName: string, mimeType?: string): St
   return null;
 }
 
+export function canContinueAfterMediaProbe(
+  kind: StickerMediaKind,
+  width: number | null,
+  height: number | null,
+): boolean {
+  return kind === 'video' || (width !== null && width > 0 && height !== null && height > 0);
+}
+
 export async function convertForTelegramSticker(
   inputPath: string,
   inputName: string,
@@ -61,7 +69,10 @@ export async function convertForTelegramSticker(
   if (kind === 'sticker') return { alreadySuitable: true };
 
   const info = await inspectMedia(inputPath);
-  if (!info.width || !info.height) {
+  // Telegram animations/GIFs can be valid inputs even when FFmpeg's metadata
+  // probe does not print the dimensions. Let the actual transcode decode them
+  // instead of rejecting them before FFmpeg gets a chance to process the video.
+  if (!canContinueAfterMediaProbe(kind, info.width, info.height)) {
     throw new StickerConversionError('I could not read this media. It may be corrupted or use an unsupported codec.');
   }
 

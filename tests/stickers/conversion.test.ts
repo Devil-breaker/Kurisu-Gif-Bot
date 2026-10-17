@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  canContinueAfterMediaProbe,
   classifyStickerDocument,
   MAX_STICKER_INPUT_BYTES,
   STICKER_SUPPORTED_FORMATS,
@@ -18,6 +19,12 @@ describe('sticker conversion input handling', () => {
   it('accepts image and video MIME types when a filename extension is missing', () => {
     expect(classifyStickerDocument('', 'image/jpeg')).toBe('image');
     expect(classifyStickerDocument('', 'video/mp4')).toBe('video');
+  });
+
+  it('lets video inputs reach transcoding when metadata dimensions are unavailable', () => {
+    expect(canContinueAfterMediaProbe('video', null, null)).toBe(true);
+    expect(canContinueAfterMediaProbe('image', null, null)).toBe(false);
+    expect(canContinueAfterMediaProbe('image', 320, 240)).toBe(true);
   });
 
   it('rejects unsupported files and advertises the input size ceiling', () => {
